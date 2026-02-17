@@ -25,13 +25,13 @@ class Config:
 
     # If True: "strong" sponsor/mobility leads must have a real company signal (email/domain)
     require_company_signal_for_strong: bool = os.environ.get("REQUIRE_COMPANY_SIGNAL_FOR_STRONG", "true").lower() in (
-        "1", "true", "yes"
+        "1",
+        "true",
+        "yes",
     )
 
     # --- Deny filters ---
-    deny_tlds: Set[str] = field(default_factory=lambda: {
-        ".gov.uk", ".nhs.uk", ".ac.uk"
-    })
+    deny_tlds: Set[str] = field(default_factory=lambda: {".gov.uk", ".nhs.uk", ".ac.uk"})
 
     deny_domains: Set[str] = field(default_factory=lambda: {
         # gov/admin
@@ -98,6 +98,39 @@ class Config:
         "ukvi guidance",
         "apply now",
         "create job alert",
+        "salary guide",
+    ])
+
+    # Hard exclude based on *name/title* (used by scoring.py hard_excluded())
+    # This is the missing attribute causing your crash.
+    name_exclude_keywords: List[str] = field(default_factory=lambda: [
+        # generic list/guide noise
+        "shortage occupation",
+        "shortage occupation list",
+        "visa sponsorship jobs",
+        "jobs with visa sponsorship",
+        "uk visa jobs",
+        "certificate of sponsorship explained",
+        "what is a skilled worker visa",
+        "immigration advice",
+        "visa blog",
+        "tier 2 guide",
+        "ukvi guidance",
+
+        # recruiters / middlemen / non-employer signals
+        "recruitment",
+        "recruiter",
+        "staffing",
+        "agency",
+        "talent acquisition",
+
+        # job-board style labels
+        "jobs",
+        "job",
+        "careers",
+        "vacancies",
+        "apply now",
+        "job alert",
         "salary guide",
     ])
 
