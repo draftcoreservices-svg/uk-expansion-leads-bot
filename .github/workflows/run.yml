@@ -18,7 +18,22 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Test Companies House API auth (safe)
+        env:
+          COMPANIES_HOUSE_API_KEY: ${{ secrets.COMPANIES_HOUSE_API_KEY }}
+        run: |
+          python - << 'PY'
+          import os, requests
+          key = os.environ.get("COMPANIES_HOUSE_API_KEY","")
+          print("Key present:", bool(key), "Length:", len(key))
+          r = requests.get("https://api.company-information.service.gov.uk/company/00000006",
+                           auth=(key, ""))
+          print("Status:", r.status_code)
+          print("Body head:", (r.text or "")[:120])
+          PY
 
       - name: Run Bot
         env:
