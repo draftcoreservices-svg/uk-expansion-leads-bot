@@ -232,6 +232,7 @@ def main():
         overseas_flag = False
 if psc_sig['has_foreign_psc']:
     overseas_flag = True
+    
 if off_sig['foreign_officer_residence'] >= 1:
     overseas_flag = True
 
@@ -239,13 +240,13 @@ if off_sig['foreign_officer_residence'] >= 1:
 if off_sig['foreign_officer_nationality'] >= 1:
     overseas_flag = True
 
+# fallback: registered office country non-UK
+if reg_country and not is_uk_country(reg_country):
+    overseas_flag = True
 
-        # fallback: registered office country non-UK
-        if reg_country and not is_uk_country(reg_country):
-            overseas_flag = True
+if not overseas_flag:
+    continue
 
-        if not overseas_flag:
-            continue
 
         # store company snapshot
         db.upsert_company(
