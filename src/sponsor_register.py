@@ -1,67 +1,131 @@
 import re
-import csv
-import io
+import hashlib
+from datetime import datetime
+from typing import Tuple, Optional
+
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from typing import Optional, Tuple
-from .config import SPONSOR_REGISTER_PAGE
-from .storage import Storage
 
-def _find_latest_csv_url(html: str) -> Optional[str]:
-    soup = BeautifulSoup(html, "lxml")
+from .config import SPONSOR_REGISTER_PAGE
+
+DEFAULT_TIMEOUT = (10, 60)  # connect, read
+
+
+def _sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def _extract_register_file_url_from_govuk(page_url: str) -> Optional[str]:
+    """
+    GOV.UK publication pages usually contain a direct link to an attachment (xlsx/csv/ods).
+    We pick the first .xlsx if present, otherwise first csv/ods.
+    """
+    r = requests.get(page_url, timeout=DEFAULT_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (CWLeadsBot/1.0)"})
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "lxml")
+    links = []
     for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "assets.publishing.service.gov.uk" in href and href.lower().endswith(".csv"):
-            return href
+        href = a["href"].strip()
+        if not href:
+            continue
+        if href.startswith("/"):
+            href = "https://www.gov.uk" + href
+        links.append(href)
+
+    # Prefer XLSX, then CSV, then ODS
+    for ext in (".xlsx", ".csv", ".ods"):
+        for href in links:
+            if href.lower().split("?")[0].endswith(ext):
+                return href
+
     return None
 
-def get_latest_register_csv_url() -> str:
-    r = requests.get(SPONSOR_REGISTER_PAGE, timeout=30, headers={"User-Agent":"Mozilla/5.0"})
+
+def _download_register_bytes() -> Tuple[bytes, str]:
+    file_url = _extract_register_file_url_from_govuk(SPONSOR_REGISTER_PAGE)
+    if not file_url:
+        raise RuntimeError(f"Could not find sponsor register attachment link on: {SPONSOR_REGISTER_PAGE}")
+
+    r = requests.get(file_url, timeout=DEFAULT_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (CWLeadsBot/1.0)"})
     r.raise_for_status()
-    url = _find_latest_csv_url(r.text)
-    if not url:
-        raise RuntimeError("Could not locate sponsor register CSV URL on GOV.UK page")
-    return url
+    return r.content, file_url
 
-def refresh_sponsor_register(storage: Storage) -> Tuple[bool, str]:
-    csv_url = get_latest_register_csv_url()
 
-    prev_url = storage.get_meta("sponsor_register_csv_url")
-    if prev_url == csv_url and storage.get_meta("sponsor_register_loaded") == "1":
-        return (False, storage.get_meta("sponsor_register_source_date") or "")
+def _load_register_df(content: bytes, file_url: str) -> pd.DataFrame:
+    lower = file_url.lower().split("?")[0]
+    if lower.endswith(".csv"):
+        df = pd.read_csv(pd.io.common.BytesIO(content))
+    else:
+        # xlsx/ods
+        df = pd.read_excel(pd.io.common.BytesIO(content))
 
-    r = requests.get(csv_url, timeout=60, headers={"User-Agent":"Mozilla/5.0"})
-    r.raise_for_status()
+    # Normalize column names
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    return df
 
-    m = re.search(r"(\d{4}-\d{2}-\d{2})", csv_url)
-    source_date = m.group(1) if m else ""
 
-    content = r.content.decode("utf-8", errors="replace")
-    reader = csv.DictReader(io.StringIO(content))
-    table = storage.db["sponsor_register"]
-    table.delete_where("1=1")
+def _normalize_name(name: str) -> str:
+    s = (name or "").lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return " ".join(s.split()).strip()
 
-    for row in reader:
-        org = (row.get("Organisation Name") or row.get("Organisation name") or row.get("Organisation") or "").strip()
-        if not org:
-            continue
-        name_norm = storage.normalize_name(org)
-        table.insert({
-            "name_norm": name_norm,
-            "org_name": org,
-            "town": (row.get("Town/City") or row.get("Town") or "").strip(),
-            "county": (row.get("County") or "").strip(),
-            "type_rating": (row.get("Type & Rating") or row.get("Type and Rating") or "").strip(),
-            "route": (row.get("Route") or "").strip(),
-            "source_date": source_date,
-        }, pk="name_norm", replace=True)
 
-    storage.upsert_meta("sponsor_register_csv_url", csv_url)
-    storage.upsert_meta("sponsor_register_loaded", "1")
-    storage.upsert_meta("sponsor_register_source_date", source_date)
-    return (True, source_date)
+def refresh_sponsor_register(storage) -> Tuple[bool, str]:
+    """
+    Downloads sponsor register and stores names in sqlite via Storage.
+    Returns (updated, src_date_str).
+    """
+    content, file_url = _download_register_bytes()
+    digest = _sha256_bytes(content)
 
-def is_on_sponsor_register(storage: Storage, org_name: str) -> bool:
-    if storage.sponsor_lookup(org_name) is not None:
-        return True
-    return storage.sponsor_lookup_fuzzy(org_name) is not None
+    # If unchanged, skip
+    existing = storage.get_meta("sponsor_register_sha256")
+    if existing and existing == digest:
+        # Still return a "date" for subject line – use today if unchanged
+        return False, datetime.utcnow().strftime("%Y-%m-%d")
+
+    df = _load_register_df(content, file_url)
+
+    # Heuristic: find best column containing organisation name
+    # Typical columns include: "organisation name", "name", "sponsor name"
+    name_col = None
+    for c in df.columns:
+        if c in ("organisation name", "organization name", "name", "sponsor name"):
+            name_col = c
+            break
+    if not name_col:
+        # fallback: first column containing "name"
+        for c in df.columns:
+            if "name" in c:
+                name_col = c
+                break
+    if not name_col:
+        raise RuntimeError(f"Could not identify sponsor name column in register file. Columns: {df.columns.tolist()}")
+
+    names = []
+    for raw in df[name_col].astype(str).tolist():
+        n = _normalize_name(raw)
+        if n:
+            names.append(n)
+
+    names = sorted(set(names))
+
+    storage.replace_sponsor_register(names)
+    storage.set_meta("sponsor_register_sha256", digest)
+    storage.set_meta("sponsor_register_source_url", file_url)
+
+    # Best-effort source date: use today (publication attachment dates can be inconsistent)
+    src_date = datetime.utcnow().strftime("%Y-%m-%d")
+    return True, src_date
+
+
+def is_on_sponsor_register(storage, company_name: str) -> bool:
+    """
+    Exact match against normalized sponsor names stored in sqlite.
+    (Fuzzy matching happens higher up / elsewhere.)
+    """
+    if not company_name:
+        return False
+    return storage.is_on_sponsor_register(_normalize_name(company_name))
