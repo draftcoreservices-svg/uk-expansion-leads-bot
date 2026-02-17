@@ -23,7 +23,7 @@ from urllib3.util.retry import Retry
 # ============================================================
 
 MAX_OUTPUT_LEADS = 20            # email/report cap (and enrichment cap)
-LOOKBACK_DAYS = 10               # Companies House incorporation window
+LOOKBACK_DAYS = 30               # Companies House incorporation window
 VERIFY_MIN_SCORE = 7             # confidence gating threshold (0-10)
 
 # SerpAPI controls
@@ -635,13 +635,14 @@ def html_report(run_meta: dict, leads: list[dict]) -> str:
         """
 
     sponsor_note = ""
-    if run_meta.get("sponsor_baselined") == "1":
+    if run_meta.get("sponsor_baselined_this_run") == "1":
         sponsor_note = """
         <div class="note" style="margin-top:12px;">
-          <b>First run baseline:</b> Sponsor Register is treated as a baseline snapshot on the first run.
+          <b>First run baseline:</b> Sponsor Register has been saved as a baseline snapshot.
           New sponsors will only be reported on subsequent runs.
         </div>
         """
+
 
     html = f"""
     <html>
@@ -728,14 +729,26 @@ def main():
         print(f"[SPONSOR] Filtered to {sponsor_total_filtered} rows (route allowlist + name cleanup).", flush=True)
 
         # First run: baseline snapshot (mark all as seen; report 0 new)
+        sponsor_baselined_this_run = "0"
+
         if sponsor_baselined != "1":
             for row, f in filtered:
                 key = sponsor_row_key(row)
                 mark_seen(conn, key, run_ts_iso)
             meta_set(conn, "sponsor_baselined", "1")
+            meta_set(conn, "sponsor_baselined_at_utc", run_ts_iso)
             sponsor_baselined = "1"
+            sponsor_baselined_this_run = "1"
             sponsor_new = []
             print("[SPONSOR] First run: baselined sponsor register. New sponsors = 0.", flush=True)
+        else:
+            for row, f in filtered:
+                key = sponsor_row_key(row)
+                if not is_seen(conn, key):
+                    mark_seen(conn, key, run_ts_iso)
+                    sponsor_new.append((row, f))
+            print(f"[SPONSOR] New sponsor rows (filtered) detected: {len(sponsor_new)}", flush=True)
+
         else:
             for row, f in filtered:
                 key = sponsor_row_key(row)
@@ -775,16 +788,31 @@ def main():
         if is_seen(conn, key):
             continue
 
+        # --- Pull registered office early so we can apply a fallback overseas signal
+        ro = item.get("registered_office_address") or {}
+        ro_country = norm_upper(ro.get("country", ""))
+
+        # Officers-based overseas signal (primary)
+        officers = []
         try:
             officers = ch_company_officers(http, company_number)
         except Exception:
-            continue
+            officers = []
 
         score, reasons, countries = overseas_signal_score(officers)
+
+        # Fallback overseas signal: registered office country is non-UK
+        # (This catches foreign-address setups even when officer data is weak/unhelpful.)
+        if ro_country and ro_country not in {"UNITED KINGDOM","UK","ENGLAND","SCOTLAND","WALES","NORTHERN IRELAND"}:
+            # If officers didn't already push it over the threshold, give it a "balanced" score.
+            if score < 5:
+                score = max(score, 6)
+                reasons = (reasons or []) + [f"Registered office country is non-UK ({ro.get('country','')})"]
+                countries = sorted(set((countries or []) + [ro.get("country","").title()]))
+
         if score < 5:  # balanced threshold
             continue
 
-        ro = item.get("registered_office_address") or {}
         address = ", ".join([x for x in [
             ro.get("address_line_1",""),
             ro.get("address_line_2",""),
@@ -946,7 +974,7 @@ def main():
         "serp_calls": serp_budget["calls"],
         "verified_sites": verified_sites,
         "sponsor_error": sponsor_error,
-        "sponsor_baselined": sponsor_baselined,
+        "sponsor_baselined_this_run": sponsor_baselined_this_run,
         "sponsor_total_filtered": sponsor_total_filtered,
     }
 
