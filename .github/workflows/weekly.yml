@@ -22,13 +22,25 @@ jobs:
 
       - name: Run weekly bot
         env:
+          PYTHONUNBUFFERED: "1"
+
+          # Enrichment / scoring
           COMPANIES_HOUSE_API_KEY: ${{ secrets.COMPANIES_HOUSE_API_KEY }}
+
+          # SerpAPI (support multiple secret/env names)
           SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          SERP_API_KEY: ${{ secrets.SERP_API_KEY }}
+
+          # OpenAI (optional triage layer)
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+
+          # Email
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-        run: python -m src.run_weekly
+        run: python -u -m src.run_weekly
