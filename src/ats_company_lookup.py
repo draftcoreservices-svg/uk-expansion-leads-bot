@@ -1,57 +1,41 @@
+from __future__ import annotations
+from typing import Optional
 from urllib.parse import urlparse
-from bs4 import BeautifulSoup
+import re
 
-
-def extract_company_website_from_ats(final_url: str, page_text: str) -> str | None:
+def extract_company_website_from_ats(page_url: str, page_text: str) -> Optional[str]:
     """
-    Attempts to extract the real company homepage from ATS pages
-    (Greenhouse / Lever / Workable).
-    Returns company website URL if found.
+    Attempt to extract the employer's real website from ATS pages (Greenhouse/Lever/Workable).
+    Returns a URL like https://company.com or None.
     """
-
-    try:
-        soup = BeautifulSoup(page_text, "lxml")
-
-        # Look for anchor tags that likely point to company homepage
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-
-            # Must be absolute URL
-            if not href.startswith("http"):
-                continue
-
-            host = urlparse(href).netloc.lower()
-
-            # Ignore ATS hosts
-            if any(x in host for x in [
-                "greenhouse.io",
-                "lever.co",
-                "workable.com",
-                "boards.greenhouse.io",
-            ]):
-                continue
-
-            # Ignore social
-            if any(x in host for x in [
-                "linkedin.com",
-                "twitter.com",
-                "x.com",
-                "facebook.com",
-                "instagram.com",
-            ]):
-                continue
-
-            # If link text looks like homepage/company
-            text = (a.get_text() or "").lower()
-            if any(k in text for k in ["home", "company", "website", "about"]):
-                return href
-
-        # Fallback: meta property og:url
-        og = soup.find("meta", property="og:url")
-        if og and og.get("content", "").startswith("http"):
-            return og["content"]
-
+    if not page_text:
         return None
 
-    except Exception:
+    # Look for obvious website links in the HTML/text
+    candidates = set()
+
+    # Common patterns like "Website" / "Company website"
+    for m in re.finditer(r'https?://[^\s"<>()]+', page_text, flags=re.IGNORECASE):
+        candidates.add(m.group(0).rstrip(").,;\"'"))
+
+    # Remove ATS links and junk
+    def is_good(u: str) -> bool:
+        try:
+            host = (urlparse(u).netloc or "").lower()
+            if not host:
+                return False
+            if host.endswith("greenhouse.io") or host.endswith("lever.co") or host.endswith("workable.com"):
+                return False
+            if host.endswith("linkedin.com") or host.endswith("facebook.com") or host.endswith("twitter.com") or host.endswith("x.com"):
+                return False
+            return True
+        except Exception:
+            return False
+
+    good = [u for u in candidates if is_good(u)]
+    if not good:
         return None
+
+    # Prefer shortest plausible root domain
+    good.sort(key=len)
+    return good[0]
