@@ -7,7 +7,11 @@ from .http_client import make_session
 from .persistence import Store, utc_now_iso
 from .sponsor_register import load_and_filter
 from .companies_house import (
-    advanced_incorporated, best_match_for_name, company_profile, company_officers, company_psc, normalize_registered_office
+    advanced_incorporated,
+    company_profile,
+    company_officers,
+    company_psc,
+    normalize_registered_office,
 )
 from .scoring import compute_score, bucket_from_score, classify_case_type, base_company_filters
 from .enrichment import find_official_homepage, scrape_verified_contacts
@@ -56,7 +60,7 @@ def main():
     store = Store()
     run_ts = utc_now_iso()
 
-    # Sponsor register (used only as an exclusion list: already-licensed sponsors are NOT our target)
+    # Sponsor register (exclusion list only: already-licensed sponsors are NOT our target)
     filtered_rows, _filtered_count = load_and_filter(session, cfg)
     sponsor_name_keys = {org_key(f["name"]) for _row, f in filtered_rows if f.get("name")}
 
@@ -98,7 +102,7 @@ def main():
         title = c["company_name"]
 
         ro = prof.get("registered_office_address") or {}
-        reg_addr, reg_postcode, reg_town, reg_country = normalize_registered_office(ro)
+        reg_addr, reg_postcode, reg_town, _reg_country = normalize_registered_office(ro)
         incorporated = prof.get("date_of_creation") or ""
 
         # Exclude existing sponsors (not our target)
@@ -110,7 +114,15 @@ def main():
         except Exception:
             officers = []
 
-        score_pre, _why_pre, _countries_pre = compute_score(cfg, source="COMPANIES_HOUSE", sponsor_route="", profile=prof, officers=officers, psc_items=[])
+        score_pre, _why_pre, _countries_pre = compute_score(
+            cfg,
+            source="COMPANIES_HOUSE",
+            sponsor_route="",
+            profile=prof,
+            officers=officers,
+            psc_items=[],
+        )
+
         psc_items = []
         if score_pre >= 45:
             try:
@@ -118,10 +130,24 @@ def main():
             except Exception:
                 psc_items = []
 
-        # Initial score (pre-enrichment); will be updated once we discover website + hiring signals.
-        score, why_list, countries = compute_score(cfg, source="COMPANIES_HOUSE", sponsor_route="", profile=prof, officers=officers, psc_items=psc_items)
+        # Initial score (pre-enrichment); updated once we discover website + hiring signals.
+        score, why_list, countries = compute_score(
+            cfg,
+            source="COMPANIES_HOUSE",
+            sponsor_route="",
+            profile=prof,
+            officers=officers,
+            psc_items=psc_items,
+        )
+
         bucket = bucket_from_score(cfg, score)
-        case_type = classify_case_type(source="COMPANIES_HOUSE", sponsor_route="", score=score, countries=countries, psc_items=psc_items)
+        case_type = classify_case_type(
+            source="COMPANIES_HOUSE",
+            sponsor_route="",
+            score=score,
+            countries=countries,
+            psc_items=psc_items,
+        )
         lead_key = make_lead_key("COMPANIES_HOUSE", num, title, reg_town)
 
         lead = {
@@ -146,32 +172,40 @@ def main():
             "job_intent": 0,
             "job_sources": "",
         }
+
         if not store.is_do_not_contact(lead_key):
             store.upsert_lead(lead)
             leads.append(lead)
 
     # Dedup
-    best = {}
+    best: Dict[str, Dict[str, Any]] = {}
     for l in leads:
         k = l["lead_key"]
         if k not in best or l.get("score", 0) > best[k].get("score", 0):
             best[k] = l
+
     leads = list(best.values())
-    leads.sort(key=lambda x: (x.get("score", 0), x.get("source", "") != "SPONSOR_REGISTER"), reverse=True)
+    leads.sort(
+        key=lambda x: (x.get("score", 0), x.get("source", "") != "SPONSOR_REGISTER"),
+        reverse=True,
+    )
 
     # Enrichment
     serp_budget = {"calls": 0, "cap": cfg.serp_max_calls_per_run}
     verified_sites = 0
 
     if serp_key:
+        # Stage A: discover likely official homepage candidates using SerpAPI
         stage_a = [l for l in leads if l.get("company_name")][: cfg.serp_stage_a_limit]
+
         for l in stage_a:
             if serp_budget["calls"] >= serp_budget["cap"]:
                 break
+
             # Allow enrichment for top WATCH leads; Serp is what creates intent signals.
-# Only skip very low-scoring noise to save budget.
-    if l.get("score", 0) < 12 and l.get("source") != "SPONSOR_REGISTER":
-        continue
+            # Only skip very low-scoring noise to save budget.
+            if l.get("score", 0) < 12 and l.get("source") != "SPONSOR_REGISTER":
+                continue
 
             candidates = find_official_homepage(
                 session,
@@ -182,10 +216,13 @@ def main():
                 serp_sleep=cfg.serp_sleep_seconds,
                 serp_budget=serp_budget,
             )
+
             if candidates:
                 l["_homepage_candidates"] = candidates
 
+        # Stage B: scrape verified contacts from the best homepage candidates
         stage_b = [l for l in leads if l.get("_homepage_candidates")][: cfg.serp_stage_b_limit]
+
         for l in stage_b:
             for base_url in l.get("_homepage_candidates", [])[:2]:
                 website, conf, emails, phones, src = scrape_verified_contacts(
@@ -196,37 +233,42 @@ def main():
                     reg_postcode=l.get("reg_postcode", ""),
                     base_url=base_url,
                 )
-                if website:
-                    l["website"] = website
-                    l["website_confidence"] = conf
-                    l["contact_source_url"] = src
 
-                    # Hiring intent scan (snippets only)
-                    ji, jr, jurls = score_hiring_intent(
-                        session,
-                        cfg,
-                        serp_key,
-                        company_name=l.get("company_name", ""),
-                        website=website,
-                        serp_sleep=cfg.serp_sleep_seconds,
-                        serp_budget=serp_budget,
-                    )
-                    if ji:
-                        l["job_intent"] = ji
-                        l["job_sources"] = ", ".join(jurls)
-                        # Recompute score to incorporate job intent
-                        # We don't store full job result content; only boost score + add reasons.
-                        l["score"] = min(100, int(l["score"]) + int(ji))
-                        l["why"] = (l.get("why", "") + "; " + "; ".join(jr)).strip("; ")
+                if not website:
+                    continue
 
-                    if conf >= cfg.verify_min_score:
-                        l["emails"] = emails
-                        l["phones"] = phones
-                        verified_sites += 1
-                        l["score"] = min(100, int(l["score"]) + 4)
-                        l["bucket"] = bucket_from_score(cfg, int(l["score"]))
-                    store.upsert_lead(l)
-                    break
+                l["website"] = website
+                l["website_confidence"] = conf
+                l["contact_source_url"] = src
+
+                # Hiring intent scan (snippets only)
+                ji, jr, jurls = score_hiring_intent(
+                    session,
+                    cfg,
+                    serp_key,
+                    company_name=l.get("company_name", ""),
+                    website=website,
+                    serp_sleep=cfg.serp_sleep_seconds,
+                    serp_budget=serp_budget,
+                )
+
+                if ji:
+                    l["job_intent"] = ji
+                    l["job_sources"] = ", ".join(jurls)
+                    # Boost score with intent; keep within 0..100
+                    l["score"] = min(100, int(l.get("score", 0)) + int(ji))
+                    l["why"] = (l.get("why", "") + "; " + "; ".join(jr)).strip("; ")
+
+                # Only publish contacts once verification threshold is met
+                if conf >= cfg.verify_min_score:
+                    l["emails"] = emails
+                    l["phones"] = phones
+                    verified_sites += 1
+                    l["score"] = min(100, int(l.get("score", 0)) + 4)
+                    l["bucket"] = bucket_from_score(cfg, int(l["score"]))
+
+                store.upsert_lead(l)
+                break
 
     # Backfill + output cap
     output: List[Dict[str, Any]] = leads[: cfg.max_output_leads]
