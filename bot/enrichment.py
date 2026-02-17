@@ -365,3 +365,27 @@ def scrape_verified_contacts(
     website = base_url
     return (website, int(conf), emails, phones, base_url)
 
+def url_domain(url: str) -> str:
+    """Backwards-compatible helper expected by job_intel.py"""
+    return _get_domain(url)
+
+
+def serp_search(
+    session,
+    serp_key: str,
+    query: str,
+    serp_budget: Dict[str, int],
+    serp_sleep: float = 1.2,
+    num: int = 10,
+) -> Dict:
+    """
+    Backwards-compatible SerpAPI search helper expected by job_intel.py.
+    """
+    return _serpapi_search(
+        session=session,
+        serp_key=serp_key,
+        query=query,
+        budget=serp_budget,
+        sleep_s=serp_sleep,
+        num=num,
+    )
