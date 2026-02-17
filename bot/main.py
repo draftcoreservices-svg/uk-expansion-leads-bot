@@ -229,14 +229,16 @@ def main():
         off_sig = _officer_signals(officers, cfg)
         psc_sig = _psc_signals(psc_items, cfg)
 
-        # Decide whether it is a candidate at all
         overseas_flag = False
-        if psc_sig['has_foreign_psc']:
-            overseas_flag = True
-        if off_sig['foreign_officer_residence'] >= 1:
-            overseas_flag = True
-        if off_sig['foreign_officer_nationality'] >= 1 and off_sig['foreign_officer_address'] >= 1:
-            overseas_flag = True
+if psc_sig['has_foreign_psc']:
+    overseas_flag = True
+if off_sig['foreign_officer_residence'] >= 1:
+    overseas_flag = True
+
+# IMPORTANT: nationality alone should count, because many foreign directors use UK service addresses
+if off_sig['foreign_officer_nationality'] >= 1:
+    overseas_flag = True
+
 
         # fallback: registered office country non-UK
         if reg_country and not is_uk_country(reg_country):
