@@ -1,27 +1,38 @@
 import re
+import time
 import requests
 from bs4 import BeautifulSoup
 from typing import Tuple
 
 
-def fetch_page(url: str, max_chars: int = 12000) -> Tuple[str, str, str]:
-    """Returns (final_url, cleaned_text_excerpt, raw_html)."""
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; CWLeadsBot/1.0)"}
-    r = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
-    r.raise_for_status()
-    final_url = r.url
-    raw_html = r.text or ""
-
-    soup = BeautifulSoup(raw_html, "lxml")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-
-    text = soup.get_text(" ", strip=True)
-    text = re.sub(r"\s+", " ", text).strip()
-    return final_url, text[:max_chars], raw_html
+DEFAULT_TIMEOUT = (10, 30)  # (connect, read)
 
 
 def fetch_page_text(url: str, max_chars: int = 12000) -> Tuple[str, str]:
-    """Backwards-compatible wrapper: returns (final_url, cleaned_text_excerpt)."""
-    final_url, text, _html = fetch_page(url, max_chars=max_chars)
-    return final_url, text
+    """Fetch a URL and return (final_url, cleaned_text_excerpt).
+
+    Uses conservative timeouts + a small retry to avoid CI hangs.
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; CWLeadsBot/1.0)"}
+    last_err: Exception | None = None
+
+    for attempt in range(2):
+        try:
+            r = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
+            r.raise_for_status()
+            final_url = r.url
+
+            soup = BeautifulSoup(r.text, "lxml")
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+
+            text = soup.get_text(" ", strip=True)
+            text = re.sub(r"\s+", " ", text).strip()
+            if len(text) > max_chars:
+                text = text[:max_chars]
+            return final_url, text
+        except Exception as e:
+            last_err = e
+            time.sleep(1.0)
+
+    raise last_err  # type: ignore
