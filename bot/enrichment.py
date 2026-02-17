@@ -365,6 +365,8 @@ def scrape_verified_contacts(
     website = base_url
     return (website, int(conf), emails, phones, base_url)
 
+# --- Compatibility wrappers for job_intel.py ---
+
 def url_domain(url: str) -> str:
     """Backwards-compatible helper expected by job_intel.py"""
     return _get_domain(url)
@@ -372,15 +374,22 @@ def url_domain(url: str) -> str:
 
 def serp_search(
     session,
-    serp_key: str,
     query: str,
-    serp_budget: Dict[str, int],
-    serp_sleep: float = 1.2,
+    serp_key: str,
     num: int = 10,
+    serp_budget: Dict[str, int] | None = None,
+    serp_sleep: float = 1.2,
 ) -> Dict:
     """
     Backwards-compatible SerpAPI search helper expected by job_intel.py.
+
+    Supports BOTH call styles:
+      serp_search(session, query, serp_key, num=10)
+      serp_search(session, query, serp_key, num=10, serp_budget=budget, serp_sleep=1.2)
     """
+    if serp_budget is None:
+        serp_budget = {"calls": 0, "cap": 999999}
+
     return _serpapi_search(
         session=session,
         serp_key=serp_key,
