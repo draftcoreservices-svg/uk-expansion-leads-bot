@@ -204,7 +204,7 @@ def main():
 
             # Allow enrichment for top WATCH leads; Serp is what creates intent signals.
             # Only skip very low-scoring noise to save budget.
-            if l.get("score", 0) < 12 and l.get("source") != "SPONSOR_REGISTER":
+            if l.get("score", 0) < 6 and l.get("source") != "SPONSOR_REGISTER":
                 continue
 
             candidates = find_official_homepage(
