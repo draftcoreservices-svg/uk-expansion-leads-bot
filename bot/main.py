@@ -168,8 +168,11 @@ def main():
         for l in stage_a:
             if serp_budget["calls"] >= serp_budget["cap"]:
                 break
-            if l.get("bucket") == "WATCH" and l.get("source") != "SPONSOR_REGISTER":
-                continue
+            # Allow enrichment for top WATCH leads; Serp is what creates intent signals.
+# Only skip very low-scoring noise to save budget.
+    if l.get("score", 0) < 12 and l.get("source") != "SPONSOR_REGISTER":
+        continue
+
             candidates = find_official_homepage(
                 session,
                 serp_key,
