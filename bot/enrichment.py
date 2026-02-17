@@ -1,177 +1,367 @@
-import time
+# bot/enrichment.py
+# Drop-in replacement: adds strong denylist filtering + better “official homepage” selection.
+# Keeps the same function signatures used by bot/main.py.
+
 import re
-from typing import Dict, List, Tuple
+import time
+from typing import Dict, List, Tuple, Optional
+from urllib.parse import urlparse, urlunparse
+
 from bs4 import BeautifulSoup
-from .utils import extract_emails, extract_phones, token_similarity
 
 
-def serp_search(session, query: str, api_key: str, num: int = 5) -> List[Dict]:
-    params = {"engine": "google", "q": query, "api_key": api_key, "num": num}
-    r = session.get("https://serpapi.com/search.json", params=params, timeout=60)
-    r.raise_for_status()
-    return (r.json().get("organic_results") or [])
+# Domains we do NOT want to treat as the company’s official website
+DENY_DOMAINS = {
+    # UK gov / corporate registries / company databases
+    "find-and-update.company-information.service.gov.uk",
+    "companieshouse.gov.uk",
+    "opencorporates.com",
+    "duedil.com",
+    "endole.co.uk",
+    "northdata.com",
+    "companycheck.co.uk",
+    "corporationwiki.com",
+    "bizapedia.com",
+    "dnb.com",
+    "dnb.co.uk",
+
+    # Social / profiles (not the official site)
+    "linkedin.com",
+    "facebook.com",
+    "instagram.com",
+    "twitter.com",
+    "x.com",
+    "youtube.com",
+    "tiktok.com",
+
+    # General business directories / aggregators
+    "crunchbase.com",
+    "bloomberg.com",
+    "zoominfo.com",
+    "signalhire.com",
+    "rocketreach.co",
+}
 
 
-def url_domain(u: str) -> str:
-    if not u:
-        return ""
-    u = re.sub(r"^https?://", "", u.strip(), flags=re.I)
-    return u.split("/")[0].lower()
+def _norm_domain(host: str) -> str:
+    host = (host or "").lower().strip()
+    host = host.split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host
 
 
-def get_url_text(session, url: str, timeout: int = 20) -> str:
+def _get_domain(url: str) -> str:
     try:
-        r = session.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 (compatible; CWLeadsBot/2.0)"})
-        if r.status_code >= 400:
-            return ""
-        return (r.text or "")[:700000]
+        return _norm_domain(urlparse(url).netloc)
     except Exception:
         return ""
 
 
-def find_contact_links(html: str, base_url: str) -> List[str]:
-    soup = BeautifulSoup(html, "lxml")
-    links = []
-    for a in soup.select("a[href]"):
-        href = (a.get("href") or "").strip()
-        if not href:
-            continue
-        label = (a.get_text(" ") or "").strip().lower()
-        if any(k in href.lower() for k in ["/contact", "contact-us", "contactus"]) or "contact" in label:
-            links.append(href)
-        if any(k in href.lower() for k in ["/privacy", "/terms", "/legal", "/imprint", "privacy", "terms"]):
-            links.append(href)
-
-    abs_links = []
-    for h in links:
-        if h.startswith("http"):
-            abs_links.append(h)
-        elif h.startswith("/"):
-            abs_links.append(base_url.rstrip("/") + h)
-        else:
-            abs_links.append(base_url.rstrip("/") + "/" + h)
-
-    out, seen = [], set()
-    for l in abs_links:
-        d = l.split("#")[0]
-        if d in seen:
-            continue
-        seen.add(d)
-        out.append(d)
-    return out[:8]
+def _base_url(url: str) -> str:
+    """Return scheme://netloc (no path/query)"""
+    try:
+        p = urlparse(url)
+        scheme = p.scheme or "https"
+        netloc = p.netloc
+        if not netloc:
+            return ""
+        return urlunparse((scheme, netloc, "", "", "", ""))
+    except Exception:
+        return ""
 
 
-def verification_signals(company_name: str, company_number: str, reg_postcode: str, page_text: str) -> Tuple[int, List[str]]:
-    ev = []
+def _is_denied(url: str) -> bool:
+    d = _get_domain(url)
+    if not d:
+        return True
+    if d in DENY_DOMAINS:
+        return True
+    # Also deny subdomains of denied domains (e.g. uk.linkedin.com)
+    for bad in DENY_DOMAINS:
+        if d.endswith("." + bad):
+            return True
+    return False
+
+
+def _clean_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def _serpapi_search(
+    session,
+    serp_key: str,
+    query: str,
+    budget: Dict[str, int],
+    sleep_s: float,
+    location: str = "United Kingdom",
+    num: int = 10,
+) -> Dict:
+    """
+    Minimal SerpAPI call using the existing requests session.
+    Budget shape: {"calls": int, "cap": int}
+    """
+    if budget["calls"] >= budget["cap"]:
+        return {}
+
+    params = {
+        "engine": "google",
+        "q": query,
+        "api_key": serp_key,
+        "google_domain": "google.co.uk",
+        "hl": "en",
+        "gl": "gb",
+        "num": num,
+        "location": location,
+    }
+
+    # Light throttling
+    if sleep_s and sleep_s > 0:
+        time.sleep(float(sleep_s))
+
+    r = session.get("https://serpapi.com/search.json", params=params, timeout=25)
+    budget["calls"] += 1
+    if not r.ok:
+        return {}
+    try:
+        return r.json()
+    except Exception:
+        return {}
+
+
+def _score_homepage_candidate(url: str, title: str, snippet: str, company_name: str) -> int:
+    """
+    Heuristic score to prefer likely official sites.
+    Higher is better.
+    """
     score = 0
-    t_upper = (page_text or "").upper()
+    d = _get_domain(url)
+    t = (title or "").lower()
+    s = (snippet or "").lower()
+    n = (company_name or "").lower()
 
-    has_number = False
-    has_postcode = False
-    has_name = False
+    if not d:
+        return -999
+    if _is_denied(url):
+        return -999
 
-    if company_number and re.search(r"\b" + re.escape(company_number) + r"\b", t_upper):
+    # Prefer non-free blog platforms (weak signal)
+    if any(x in d for x in ["wordpress.com", "blogspot.", "wixsite."]):
+        score -= 10
+
+    # Prefer typical corporate signals
+    if any(x in url.lower() for x in ["/careers", "/jobs", "/contact", "/about"]):
+        score += 8
+
+    # Title/snippet contains company name (strong)
+    if n and n[:6] in t:
+        score += 12
+    if n and n[:6] in s:
         score += 6
-        has_number = True
-        ev.append("Company number found on site")
+    if n and n in t:
+        score += 10
+    if n and n in s:
+        score += 5
 
-    if reg_postcode:
-        pc = reg_postcode.replace(" ", "").upper()
-        if pc and pc in t_upper.replace(" ", ""):
-            score += 3
-            has_postcode = True
-            ev.append("Registered postcode found on site")
+    # Penalise obvious directory language
+    if any(x in t for x in ["company profile", "company information", "companies house", "director", "filings"]):
+        score -= 25
+    if any(x in s for x in ["company profile", "company information", "companies house", "director", "filings"]):
+        score -= 15
 
-    if company_name:
-        snippet = re.sub(r"\s+", " ", (page_text or "")[:20000])
-        sim = token_similarity(company_name, snippet)
-        if sim >= 75:
-            score += 2
-            has_name = True
-            ev.append(f"Name similarity strong ({sim})")
-        elif sim >= 60:
-            score += 1
-            has_name = True
-            ev.append(f"Name similarity moderate ({sim})")
+    # Prefer UK-ish domains slightly (tiny nudge)
+    if d.endswith(".co.uk") or d.endswith(".uk"):
+        score += 3
 
-    if sum([has_number, has_postcode, has_name]) >= 2:
-        score = min(10, score + 1)
-        ev.append("2-of-3 verification signals met")
-    return min(score, 10), ev
+    return score
 
 
-def find_official_homepage(session, serp_key: str, company_name: str, reg_postcode: str, town: str, serp_sleep: float, serp_budget: Dict) -> List[str]:
-    if serp_budget["calls"] >= serp_budget["cap"]:
+def find_official_homepage(
+    session,
+    serp_key: str,
+    company_name: str,
+    reg_postcode: str = "",
+    town: str = "",
+    serp_sleep: float = 1.2,
+    serp_budget: Optional[Dict[str, int]] = None,
+) -> List[str]:
+    """
+    Returns a list of base URLs (scheme://domain) that look like the official company website.
+    Filters out directories/aggregators/social aggressively.
+    """
+    if not serp_key:
         return []
-    q = f"\"{company_name}\" {reg_postcode}".strip() if reg_postcode else f"\"{company_name}\" {town} contact".strip()
-    serp_budget["calls"] += 1
-    results = serp_search(session, q, serp_key, num=6)
-    time.sleep(serp_sleep)
+    if serp_budget is None:
+        serp_budget = {"calls": 0, "cap": 999999}
 
-    candidates = []
-    for r in results:
+    name = _clean_text(company_name)
+    if not name:
+        return []
+
+    # Query tries to bias towards “official site”
+    q = f'"{name}" official website'
+    if town:
+        q += f" {town}"
+    if reg_postcode:
+        q += f" {reg_postcode}"
+
+    data = _serpapi_search(
+        session=session,
+        serp_key=serp_key,
+        query=q,
+        budget=serp_budget,
+        sleep_s=serp_sleep,
+        num=10,
+    )
+
+    organic = data.get("organic_results") or []
+    scored: List[Tuple[int, str]] = []
+
+    for r in organic:
         link = r.get("link") or ""
-        if not link.startswith("http"):
+        title = r.get("title") or ""
+        snippet = r.get("snippet") or ""
+
+        if not link:
             continue
-        d = url_domain(link)
-        if not d:
+        if _is_denied(link):
             continue
-        if any(x in d for x in [
-            "companieshouse.gov.uk", "gov.uk", "linkedin.com", "facebook.com", "yell.com", "endole.co.uk",
-            "opencorporates.com", "find-and-update.company-information.service.gov.uk",
-            "bloomberg.com", "dnb.com", "zoominfo.com", "crunchbase.com", "glassdoor.",
-        ]):
+
+        b = _base_url(link)
+        if not b or _is_denied(b):
             continue
-        candidates.append("https://" + d)
 
-    out, seen = [], set()
-    for c in candidates:
-        if c in seen:
+        sc = _score_homepage_candidate(link, title, snippet, name)
+        if sc <= -100:
             continue
-        seen.add(c)
-        out.append(c)
-    return out[:3]
+        scored.append((sc, b))
+
+    # Dedup while keeping best score
+    best: Dict[str, int] = {}
+    for sc, b in scored:
+        if b not in best or sc > best[b]:
+            best[b] = sc
+
+    ranked = sorted(best.items(), key=lambda x: x[1], reverse=True)
+    return [b for b, _sc in ranked[:5]]
 
 
-def scrape_verified_contacts(session, cfg, company_name: str, company_number: str, reg_postcode: str, base_url: str) -> Tuple[str, int, str, str, str]:
-    home_html = get_url_text(session, base_url)
-    if not home_html:
-        return "", 0, "", "", ""
+_EMAIL_RE = re.compile(r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})")
+_PHONE_RE = re.compile(r"(\+?\d[\d\s().\-]{7,}\d)")
 
-    best_score, _ = verification_signals(company_name, company_number, reg_postcode, home_html)
-    best_source = base_url
 
-    links = find_contact_links(home_html, base_url)
-    for l in links[:6]:
-        extra = get_url_text(session, l)
-        if not extra:
-            continue
-        s2, _ = verification_signals(company_name, company_number, reg_postcode, extra)
-        if s2 > best_score:
-            best_score = s2
-            best_source = l
+def _extract_contacts(html: str) -> Tuple[str, str]:
+    emails = sorted(set(m.group(1) for m in _EMAIL_RE.finditer(html or "")))
+    phones = sorted(set(_clean_text(m.group(1)) for m in _PHONE_RE.finditer(html or "")))
+    # Basic cleanup
+    emails = [e for e in emails if len(e) <= 120]
+    phones = [p for p in phones if 8 <= len(p) <= 30]
+    return ", ".join(emails[:8]), ", ".join(phones[:6])
 
-    if best_score < cfg.verify_min_score:
-        return base_url, best_score, "", "", best_source
 
-    combined = BeautifulSoup(home_html, "lxml").get_text(" ", strip=True)
-    for l in links[:5]:
-        extra = get_url_text(session, l)
-        if extra:
-            combined += " " + BeautifulSoup(extra, "lxml").get_text(" ", strip=True)
+def _verification_score(
+    soup: BeautifulSoup,
+    company_name: str,
+    reg_postcode: str,
+    base_url: str,
+) -> int:
+    score = 0
+    text = _clean_text(soup.get_text(" ", strip=True)).lower()
+    title = _clean_text(soup.title.get_text(" ", strip=True) if soup.title else "").lower()
 
-    emails = extract_emails(combined)
-    phones = extract_phones(combined)
+    name = (company_name or "").lower().strip()
+    pc = (reg_postcode or "").lower().replace(" ", "")
 
-    kept = []
-    for e in emails:
-        local = (e.split("@")[0] or "").lower()
-        if cfg.allow_personal_emails:
-            kept.append(e)
-            continue
-        if local in cfg.allowed_email_prefixes:
-            kept.append(e)
+    if not _is_denied(base_url):
+        score += 2
 
-    emails = kept[:5]
-    phones = phones[:5]
-    return base_url, best_score, ", ".join(emails), ", ".join(phones), best_source
+    if name and name in title:
+        score += 4
+    if name and name[:10] in title:
+        score += 2
+    if name and name in text:
+        score += 2
+
+    if pc and pc in text.replace(" ", ""):
+        score += 3
+
+    # Contact/about links are a positive sign
+    links = [(_clean_text(a.get("href") or ""), _clean_text(a.get_text(" ", strip=True)).lower()) for a in soup.find_all("a")]
+    if any("contact" in (h.lower() + " " + t) for h, t in links):
+        score += 2
+    if any("about" in (h.lower() + " " + t) for h, t in links):
+        score += 1
+    if any("careers" in (h.lower() + " " + t) or "jobs" in (h.lower() + " " + t) for h, t in links):
+        score += 2
+
+    return score
+
+
+def scrape_verified_contacts(
+    session,
+    cfg,
+    company_name: str,
+    company_number: str,
+    reg_postcode: str,
+    base_url: str,
+) -> Tuple[str, int, str, str, str]:
+    """
+    Fetch a candidate base URL, attempt to verify it looks like the official site,
+    and extract public contact details. Returns:
+    (website, confidence_score, emails, phones, source_url)
+    """
+    if not base_url:
+        return ("", 0, "", "", "")
+
+    # Deny obvious aggregator domains up-front
+    if _is_denied(base_url):
+        return ("", 0, "", "", base_url)
+
+    try:
+        r = session.get(base_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        if not r.ok or not (r.text or "").strip():
+            return ("", 0, "", "", base_url)
+    except Exception:
+        return ("", 0, "", "", base_url)
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    conf = _verification_score(soup, company_name=company_name, reg_postcode=reg_postcode, base_url=base_url)
+
+    # Extract contacts from homepage
+    emails, phones = _extract_contacts(r.text)
+
+    # If no contacts on homepage, try one contact-ish page (light touch)
+    if not emails and not phones:
+        contact_href = ""
+        for a in soup.find_all("a"):
+            href = a.get("href") or ""
+            txt = (a.get_text(" ", strip=True) or "").lower()
+            if "contact" in href.lower() or "contact" in txt:
+                contact_href = href
+                break
+        if contact_href:
+            # Make absolute if needed
+            if contact_href.startswith("/"):
+                contact_url = base_url.rstrip("/") + contact_href
+            elif contact_href.startswith("http"):
+                contact_url = contact_href
+            else:
+                contact_url = base_url.rstrip("/") + "/" + contact_href.lstrip("/")
+
+            if not _is_denied(contact_url):
+                try:
+                    rc = session.get(contact_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+                    if rc.ok and (rc.text or "").strip():
+                        e2, p2 = _extract_contacts(rc.text)
+                        if e2:
+                            emails = e2
+                            conf += 1
+                        if p2:
+                            phones = p2
+                            conf += 1
+                except Exception:
+                    pass
+
+    website = base_url
+    return (website, int(conf), emails, phones, base_url)
+
