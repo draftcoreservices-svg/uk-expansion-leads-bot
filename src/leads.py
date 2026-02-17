@@ -16,6 +16,8 @@ class Lead:
     final_url: str = ""
     page_text: str = ""
     company_or_person: str = ""
+    company_website: Optional[str] = None
+
 
     # Scoring
     score: int = 0
