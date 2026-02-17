@@ -749,14 +749,6 @@ def main():
                     sponsor_new.append((row, f))
             print(f"[SPONSOR] New sponsor rows (filtered) detected: {len(sponsor_new)}", flush=True)
 
-        else:
-            for row, f in filtered:
-                key = sponsor_row_key(row)
-                if not is_seen(conn, key):
-                    mark_seen(conn, key, run_ts_iso)
-                    sponsor_new.append((row, f))
-            print(f"[SPONSOR] New sponsor rows (filtered) detected: {len(sponsor_new)}", flush=True)
-
     except Exception as e:
         sponsor_error = str(e)
         print(f"[SPONSOR] ERROR: {sponsor_error}", flush=True)
