@@ -3,10 +3,11 @@ from urllib.parse import urlparse
 
 import threading
 import time
+import os
 
 from .ats_company_lookup import extract_company_website_from_ats
 from .companies_house import CompaniesHouseClient
-from .config import CFG
+from .config import CFG, Config
 from .email_report import build_email
 from .emailer import send_email
 from .extract import extract_contacts
@@ -32,7 +33,6 @@ def _set_step(s: str) -> None:
     print(f"[STEP] {_current_step}", flush=True)
 
 def _watchdog(interval_s: int = 30) -> None:
-    # Periodically emits a heartbeat so GitHub Actions shows progress even if a network call blocks.
     while True:
         time.sleep(interval_s)
         print(f"[HEARTBEAT] still running | step={_current_step}", flush=True)
@@ -72,7 +72,6 @@ def _label_from_title(title: str) -> str:
         return ""
     t = title.strip()
     t = t.replace("–", "-").replace("—", "-")
-    # keep first segment if looks like “Company - Job title”
     if " - " in t:
         return t.split(" - ", 1)[0].strip()
     if " | " in t:
@@ -88,20 +87,41 @@ def _safe_company_domain(email: str) -> bool:
         return False
 
 
+def _resolve_queries() -> dict[str, list[str]]:
+    # Use CFG.queries if present, otherwise fall back to defaults.
+    q = getattr(CFG, "queries", None)
+    if isinstance(q, dict) and any(v for v in q.values()):
+        # Normalize bucket keys to expected names
+        out: dict[str, list[str]] = {}
+        for k, v in q.items():
+            if not v:
+                continue
+            kk = (k or "").strip().lower()
+            if kk in ("sponsor", "sponsorship", "sponsor_leads"):
+                kk = "sponsor"
+            elif kk in ("mobility", "expansion", "global_mobility"):
+                kk = "mobility"
+            elif kk in ("talent", "global_talent"):
+                kk = "talent"
+            out[kk] = [x for x in v if (x or "").strip()]
+        if any(out.values()):
+            return out
+
+    # Hard fallback
+    return Config().queries
+
+
 def main():
-    # Start watchdog early to avoid "no output" hangs in GitHub Actions.
-    t = threading.Thread(target=_watchdog, daemon=True)
-    t.start()
+    threading.Thread(target=_watchdog, daemon=True).start()
 
     start = datetime.utcnow()
     _set_step(f"start @ {start.isoformat()}Z")
     print(f"[START] CW weekly run @ {start.isoformat()}Z", flush=True)
-    print(
-        f"[ENV] SERP key set={bool(__import__('os').environ.get('SERPAPI_API_KEY') or __import__('os').environ.get('SERPAPI_KEY') or __import__('os').environ.get('SERP_API_KEY'))}",
-        flush=True,
-    )
-    print(f"[ENV] OPENAI_API_KEY set={bool(__import__('os').environ.get('OPENAI_API_KEY'))}", flush=True)
-    print(f"[ENV] COMPANIES_HOUSE_API_KEY set={bool(__import__('os').environ.get('COMPANIES_HOUSE_API_KEY'))}", flush=True)
+
+    serp_key_present = bool(os.environ.get("SERPAPI_API_KEY") or os.environ.get("SERPAPI_KEY") or os.environ.get("SERP_API_KEY"))
+    print(f"[ENV] SERP key set={serp_key_present}", flush=True)
+    print(f"[ENV] OPENAI_API_KEY set={bool(os.environ.get('OPENAI_API_KEY'))}", flush=True)
+    print(f"[ENV] COMPANIES_HOUSE_API_KEY set={bool(os.environ.get('COMPANIES_HOUSE_API_KEY'))}", flush=True)
 
     _set_step("init storage")
     storage = Storage("cache.sqlite")
@@ -116,8 +136,6 @@ def main():
     print("[OK] CompaniesHouseClient initialised", flush=True)
 
     _set_step("refresh sponsor register")
-
-    # 1) Refresh sponsor register
     try:
         updated, src_date = refresh_sponsor_register(storage)
         print(f"[OK] Sponsor Register refreshed updated={updated} src_date={src_date}", flush=True)
@@ -125,20 +143,26 @@ def main():
         print(f"[WARN] Sponsor Register refresh failed: {e}", flush=True)
         src_date = ""
 
-    # 2) Serp searches
     _set_step("load queries")
-    queries = getattr(CFG, "queries", {})
-    leads: list[Lead] = []
+    queries = _resolve_queries()
+    total_q = sum(len(v) for v in queries.values())
+    print(f"[CFG] buckets={list(queries.keys())} total_queries={total_q}", flush=True)
+    for b, ql in queries.items():
+        print(f"[CFG] bucket={b} queries={len(ql)}", flush=True)
 
     _set_step("run serp searches")
+    leads: list[Lead] = []
+
     for bucket, qlist in queries.items():
         for q in qlist:
             q = (q or "").strip()
             if not q:
                 continue
+
             print(f"[SEARCH] bucket={bucket} q={q}", flush=True)
             try:
                 items = serp.search(q, num=getattr(CFG, "serp_num", 10))
+                print(f"[SEARCH] results={len(items)} bucket={bucket}", flush=True)
             except Exception as e:
                 print(f"[WARN] Serp search failed q={q}: {e}", flush=True)
                 continue
@@ -147,6 +171,7 @@ def main():
                 title = it.get("title", "")
                 link = it.get("link", "")
                 snippet = it.get("snippet", "")
+
                 if not link or _denied(link):
                     continue
 
@@ -179,7 +204,7 @@ def main():
     leads = deduped
     print(f"[STATS] deduped_leads={len(leads)}", flush=True)
 
-    # 3) Enrichment
+    _set_step("enrichment")
     enriched: list[Lead] = []
     for lead in leads:
         url = lead.url
@@ -195,7 +220,6 @@ def main():
             lead.page_text = ""
             lead.final_url = url
 
-        # ATS site extraction
         try:
             site = extract_company_website_from_ats(lead.final_url or url, lead.page_text or "")
             if site and not _denied(site):
@@ -203,7 +227,6 @@ def main():
         except Exception:
             pass
 
-        # Contacts
         try:
             contacts = extract_contacts((lead.company_website or lead.final_url or url), lead.page_text or "")
             lead.emails = sorted(set(contacts.get("emails", []) or []))
@@ -212,7 +235,6 @@ def main():
             lead.emails = lead.emails or []
             lead.phones = lead.phones or []
 
-        # Sponsor register check (only meaningful for sponsor bucket, but safe to store)
         try:
             on_reg = False
             if lead.label:
@@ -221,7 +243,6 @@ def main():
         except Exception:
             lead.on_sponsor_register = None
 
-        # Companies House (best-effort; conservative match returns None if unsure)
         try:
             if lead.label:
                 ch_hit = ch.search_company(lead.label)
@@ -230,13 +251,11 @@ def main():
             print(f"[WARN] Companies House lookup failed label={lead.label}: {e}", flush=True)
             lead.companies_house = None
 
-        # Heuristic score
         try:
             lead.score = score_heuristic(lead)
         except Exception:
             lead.score = 0
 
-        # Optional AI refinement
         if openai_enabled():
             try:
                 ai = classify_lead(
@@ -254,15 +273,14 @@ def main():
         enriched.append(lead)
 
     leads = enriched
+
     _set_step("scoring and filtering")
     print(f"[STATS] total_leads={len(leads)}", flush=True)
 
-    # 4) Strong lead selection
     sponsor_strong = [l for l in leads if l.bucket == "sponsor" and (l.score or 0) >= getattr(CFG, "min_score_sponsor", 70)]
     mobility_strong = [l for l in leads if l.bucket == "mobility" and (l.score or 0) >= getattr(CFG, "min_score_mobility", 70)]
     talent_strong = [l for l in leads if l.bucket == "talent" and (l.score or 0) >= getattr(CFG, "min_score_talent", 75)]
 
-    # Prefer corporate emails (if present)
     for l in sponsor_strong + mobility_strong + talent_strong:
         if l.emails:
             l.emails = sorted(l.emails, key=lambda e: (not _safe_company_domain(e), e))
