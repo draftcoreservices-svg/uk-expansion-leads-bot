@@ -40,9 +40,9 @@ jobs:
           MAX_OUTPUT_LEADS: ${{ secrets.MAX_OUTPUT_LEADS }}
 
           # Tuning knobs (read by bot/config.py)
-          LOOKBACK_DAYS: "180"
-          SERP_STAGE_A_LIMIT: "80"
-          SERP_STAGE_B_LIMIT: "40"
+          LOOKBACK_DAYS: "365"
+          SERP_STAGE_A_LIMIT: "200"
+          SERP_STAGE_B_LIMIT: "80"
           VERIFY_MIN_SCORE: "4"
           SERP_MAX_CALLS_PER_RUN: "120"
 
