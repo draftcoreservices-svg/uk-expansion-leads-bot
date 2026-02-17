@@ -1,7 +1,10 @@
 from datetime import datetime
 from urllib.parse import urlparse
 
-from .ats_company_lookup import extract_company_website_from_ats, extract_company_name_from_ats
+import threading
+import time
+
+from .ats_company_lookup import extract_company_website_from_ats
 from .companies_house import CompaniesHouseClient
 from .config import CFG
 from .email_report import build_email
@@ -13,13 +16,26 @@ from .scoring import score_heuristic
 from .serp import SerpClient
 from .sponsor_register import refresh_sponsor_register, is_on_sponsor_register
 from .storage import Storage
-from .text_extract import fetch_page
+from .text_extract import fetch_page_text
 
 
 FREE_EMAIL_DOMAINS = {
     "gmail.com", "hotmail.com", "outlook.com", "live.com", "yahoo.com", "icloud.com",
     "proton.me", "protonmail.com", "aol.com", "gmx.com"
 }
+
+_current_step = "boot"
+
+def _set_step(s: str) -> None:
+    global _current_step
+    _current_step = s
+    print(f"[STEP] {_current_step}", flush=True)
+
+def _watchdog(interval_s: int = 30) -> None:
+    # Periodically emits a heartbeat so GitHub Actions shows progress even if a network call blocks.
+    while True:
+        time.sleep(interval_s)
+        print(f"[HEARTBEAT] still running | step={_current_step}", flush=True)
 
 
 def _denied(url: str) -> bool:
@@ -54,295 +70,219 @@ def _content_excluded(title: str, snippet: str) -> str | None:
 def _label_from_title(title: str) -> str:
     if not title:
         return ""
-    for sep in ["|", " - ", " — ", " · "]:
-        if sep in title:
-            title = title.split(sep)[0]
-            break
-    return title.strip()[:120]
+    t = title.strip()
+    t = t.replace("–", "-").replace("—", "-")
+    # keep first segment if looks like “Company - Job title”
+    if " - " in t:
+        return t.split(" - ", 1)[0].strip()
+    if " | " in t:
+        return t.split(" | ", 1)[0].strip()
+    return t[:80]
 
 
-def _extract_employer_from_ats(url: str) -> str | None:
-    """
-    Greenhouse/Lever/Workable: derive employer slug from URL.
-    Examples:
-      https://job-boards.greenhouse.io/monzo/jobs/...
-      https://jobs.lever.co/spotify/...
-      https://apply.workable.com/costello-medical/j/...
-    """
+def _safe_company_domain(email: str) -> bool:
     try:
-        u = urlparse(url)
-        host = (u.netloc or "").lower()
-        parts = [p for p in (u.path or "").split("/") if p]
-
-        if host in {"job-boards.greenhouse.io", "boards.greenhouse.io"}:
-            if len(parts) >= 1:
-                return parts[0]
-
-        if host == "jobs.lever.co":
-            if len(parts) >= 1:
-                return parts[0]
-
-        if host == "apply.workable.com":
-            if len(parts) >= 1:
-                return parts[0]
-
-        return None
+        dom = (email.split("@", 1)[1] or "").lower().strip()
+        return dom and dom not in FREE_EMAIL_DOMAINS
     except Exception:
-        return None
-
-
-def _has_company_signal(lead: Lead) -> bool:
-    # Non-free email domain is a strong signal
-    for e in (lead.contact_emails or []):
-        e = (e or "").strip().lower()
-        if "@" in e:
-            dom = e.split("@", 1)[1]
-            if dom and dom not in FREE_EMAIL_DOMAINS:
-                return True
-
-    # Or final URL on a non-ATS, non-deny domain
-    try:
-        u = urlparse(lead.final_url or lead.url)
-        host = (u.netloc or "").lower()
-        ats_hosts = getattr(CFG, "ats_hosts", set())
-        deny_domains = getattr(CFG, "deny_domains", set())
-        if host and host not in ats_hosts and host not in deny_domains:
-            return True
-    except Exception:
-        pass
-
-    return False
-
-
-def _build_leads(serp: SerpClient, lead_type: str, queries: list[str]) -> list[Lead]:
-    out: list[Lead] = []
-    print(f"[SERP] Building leads for {lead_type} — queries={len(queries)}")
-    for i, q in enumerate(queries, start=1):
-        print(f"[SERP] ({lead_type}) Query {i}/{len(queries)}: {q}")
-        results = serp.search(q, num=CFG.max_results_per_query)
-        print(f"[SERP] ({lead_type}) Got {len(results)} results")
-        for r in results:
-            url = (r.get("link") or "").strip()
-            if not url:
-                continue
-            if _denied(url):
-                continue
-
-            title = r.get("title", "") or ""
-            snippet = r.get("snippet", "") or ""
-
-            bad_phrase = _content_excluded(title, snippet)
-            if bad_phrase:
-                continue
-
-            out.append(
-                Lead(
-                    lead_type=lead_type,
-                    title=title,
-                    url=url,
-                    snippet=snippet,
-                    query=r.get("query", ""),
-                )
-            )
-    print(f"[SERP] {lead_type} candidates after deny-filter/content-filter: {len(out)}")
-    return out
+        return False
 
 
 def main():
+    # Start watchdog early to avoid "no output" hangs in GitHub Actions.
+    t = threading.Thread(target=_watchdog, daemon=True)
+    t.start()
+
     start = datetime.utcnow()
-    print(f"[START] CW weekly run @ {start.isoformat()}Z")
+    _set_step(f"start @ {start.isoformat()}Z")
+    print(f"[START] CW weekly run @ {start.isoformat()}Z", flush=True)
+    print(
+        f"[ENV] SERP key set={bool(__import__('os').environ.get('SERPAPI_API_KEY') or __import__('os').environ.get('SERPAPI_KEY') or __import__('os').environ.get('SERP_API_KEY'))}",
+        flush=True,
+    )
+    print(f"[ENV] OPENAI_API_KEY set={bool(__import__('os').environ.get('OPENAI_API_KEY'))}", flush=True)
+    print(f"[ENV] COMPANIES_HOUSE_API_KEY set={bool(__import__('os').environ.get('COMPANIES_HOUSE_API_KEY'))}", flush=True)
 
+    _set_step("init storage")
     storage = Storage("cache.sqlite")
-    print("[OK] Storage initialised")
+    print("[OK] Storage initialised", flush=True)
 
+    _set_step("init serp client")
     serp = SerpClient()
-    print("[OK] SerpClient initialised")
+    print("[OK] SerpClient initialised", flush=True)
 
+    _set_step("init companies house client")
     ch = CompaniesHouseClient()
-    print("[OK] CompaniesHouseClient initialised")
+    print("[OK] CompaniesHouseClient initialised", flush=True)
+
+    _set_step("refresh sponsor register")
 
     # 1) Refresh sponsor register
     try:
         updated, src_date = refresh_sponsor_register(storage)
-        print(f"[SPONSOR-REG] refreshed={updated} source_date={src_date}")
+        print(f"[OK] Sponsor Register refreshed updated={updated} src_date={src_date}", flush=True)
     except Exception as e:
-        print(f"[SPONSOR-REG] refresh failed (continuing): {repr(e)}")
-        updated, src_date = (False, "")
+        print(f"[WARN] Sponsor Register refresh failed: {e}", flush=True)
+        src_date = ""
 
-    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    # 2) Serp searches
+    _set_step("load queries")
+    queries = getattr(CFG, "queries", {})
+    leads: list[Lead] = []
 
-    # 2) Gather candidates
-    raw_sponsor = _build_leads(serp, "sponsor_licence", CFG.sponsor_queries)
-    raw_mobility = _build_leads(serp, "global_mobility", CFG.mobility_queries)
-    raw_talent = _build_leads(serp, "global_talent", CFG.talent_queries)
+    _set_step("run serp searches")
+    for bucket, qlist in queries.items():
+        for q in qlist:
+            q = (q or "").strip()
+            if not q:
+                continue
+            print(f"[SEARCH] bucket={bucket} q={q}", flush=True)
+            try:
+                items = serp.search(q, num=getattr(CFG, "serp_num", 10))
+            except Exception as e:
+                print(f"[WARN] Serp search failed q={q}: {e}", flush=True)
+                continue
 
-    all_raw = raw_sponsor + raw_mobility + raw_talent
-    print(f"[TOTAL] total raw candidates: {len(all_raw)}")
-
-    sponsor_strong: list[Lead] = []
-    mobility_strong: list[Lead] = []
-    talent_strong: list[Lead] = []
-
-    pages_fetched = 0
-    openai_calls = 0
-    processed = 0
-    skipped_seen = 0
-
-    for lead in all_raw:
-        lead_id = storage.lead_id(lead.lead_type, lead.url, lead.title)
-
-        if storage.seen_before(lead_id):
-            skipped_seen += 1
-            continue
-
-        if pages_fetched >= CFG.max_pages_to_fetch:
-            print("[STOP] max_pages_to_fetch reached")
-            break
-
-        processed += 1
-
-        # Fetch page text + keep raw HTML for ATS extraction
-        try:
-            final_url, text, html = fetch_page(lead.url, max_chars=CFG.page_text_max_chars)
-            lead.final_url = final_url  # keep as the source page URL
-            lead.page_text = text
-            pages_fetched += 1
-        except Exception:
-            storage.mark_seen(lead_id, lead.lead_type, lead.title, lead.url, now_iso)
-            continue
-
-        # Extract contacts from the fetched page (ATS page etc.)
-        emails, phones = extract_contacts(lead.page_text)
-        lead.contact_emails = emails
-        lead.contact_phones = phones
-
-        # Post-fetch content exclusion (catches pages whose SERP snippet looked OK but page is a guide/list)
-        try:
-            host = (urlparse(lead.final_url or lead.url).netloc or "").lower()
-            ats_hosts = getattr(CFG, "ats_hosts", set())
-            if host and host not in ats_hosts:
-                bad_phrase = _content_excluded(lead.title, lead.page_text)
-                if bad_phrase:
-                    storage.mark_seen(lead_id, lead.lead_type, lead.title, lead.url, now_iso)
+            for it in items:
+                title = it.get("title", "")
+                link = it.get("link", "")
+                snippet = it.get("snippet", "")
+                if not link or _denied(link):
                     continue
+
+                excl = _content_excluded(title, snippet)
+                if excl:
+                    continue
+
+                label = _label_from_title(title)
+                leads.append(
+                    Lead(
+                        bucket=bucket,
+                        label=label,
+                        url=link,
+                        title=title,
+                        snippet=snippet,
+                        score=0,
+                    )
+                )
+
+    print(f"[STATS] serp_leads={len(leads)}", flush=True)
+
+    # Deduplicate by URL
+    seen = set()
+    deduped: list[Lead] = []
+    for l in leads:
+        if l.url in seen:
+            continue
+        seen.add(l.url)
+        deduped.append(l)
+    leads = deduped
+    print(f"[STATS] deduped_leads={len(leads)}", flush=True)
+
+    # 3) Enrichment
+    enriched: list[Lead] = []
+    for lead in leads:
+        url = lead.url
+        print(f"[ENRICH] {lead.bucket} | {lead.label} | {url}", flush=True)
+
+        try:
+            _set_step(f"fetch page {url}")
+            final_url, page_text = fetch_page_text(url)
+            lead.final_url = final_url
+            lead.page_text = page_text
+        except Exception as e:
+            print(f"[WARN] fetch failed url={url}: {e}", flush=True)
+            lead.page_text = ""
+            lead.final_url = url
+
+        # ATS site extraction
+        try:
+            site = extract_company_website_from_ats(lead.final_url or url, lead.page_text or "")
+            if site and not _denied(site):
+                lead.company_website = site
         except Exception:
             pass
 
-        # Label + ATS homepage enrichment
-        employer = _extract_employer_from_ats(lead.final_url or lead.url)
+        # Contacts
+        try:
+            contacts = extract_contacts((lead.company_website or lead.final_url or url), lead.page_text or "")
+            lead.emails = sorted(set(contacts.get("emails", []) or []))
+            lead.phones = sorted(set(contacts.get("phones", []) or []))
+        except Exception:
+            lead.emails = lead.emails or []
+            lead.phones = lead.phones or []
 
-        if employer:
-            # Prefer a human brand name if we can extract it from ATS HTML
-            brand = extract_company_name_from_ats(html or "")
-            lead.company_or_person = brand or employer
+        # Sponsor register check (only meaningful for sponsor bucket, but safe to store)
+        try:
+            on_reg = False
+            if lead.label:
+                on_reg = is_on_sponsor_register(storage, lead.label)
+            lead.on_sponsor_register = bool(on_reg)
+        except Exception:
+            lead.on_sponsor_register = None
 
-            # Try to extract real company homepage from ATS page
-            company_site = extract_company_website_from_ats(
-                page_url=(lead.final_url or lead.url),
-                page_html_or_text=(html or "")
-            )
+        # Companies House (best-effort; conservative match returns None if unsure)
+        try:
+            if lead.label:
+                ch_hit = ch.search_company(lead.label)
+                lead.companies_house = ch_hit
+        except Exception as e:
+            print(f"[WARN] Companies House lookup failed label={lead.label}: {e}", flush=True)
+            lead.companies_house = None
 
-            if company_site:
-                lead.company_website = company_site
+        # Heuristic score
+        try:
+            lead.score = score_heuristic(lead)
+        except Exception:
+            lead.score = 0
 
-                # Fetch company homepage for better contact discovery (do NOT overwrite source URL)
-                try:
-                    _final_home, home_text, _home_html = fetch_page(company_site, max_chars=CFG.page_text_max_chars)
-                    emails, phones = extract_contacts(home_text)
-                    # Merge contacts (prefer corporate emails)
-                    lead.contact_emails = sorted(set((lead.contact_emails or []) + emails))[:6]
-                    lead.contact_phones = sorted(set((lead.contact_phones or []) + phones))[:4]
-                except Exception:
-                    pass
-        else:
-            lead.company_or_person = _label_from_title(lead.title)
-
-        # Sponsor register check
-        if lead.lead_type == "sponsor_licence":
+        # Optional AI refinement
+        if openai_enabled():
             try:
-                lead.on_sponsor_register = is_on_sponsor_register(storage, lead.company_or_person)
+                ai = classify_lead(
+                    lead_type_hint=lead.bucket,
+                    label=lead.label or "",
+                    url=lead.final_url or lead.url,
+                    title=lead.title or "",
+                    snippet=lead.snippet or "",
+                    page_text=lead.page_text or "",
+                )
+                lead.ai = ai or None
             except Exception:
-                lead.on_sponsor_register = None
+                lead.ai = None
 
-        # Companies House enrichment
-        if lead.lead_type in ("sponsor_licence", "global_mobility"):
-            try:
-                if lead.company_or_person and len(lead.company_or_person) >= 3:
-                    lead.companies_house = ch.search_company(lead.company_or_person)
-            except Exception:
-                lead.companies_house = None
+        enriched.append(lead)
 
-        # Heuristic scoring
-        lead = score_heuristic(lead)
+    leads = enriched
+    _set_step("scoring and filtering")
+    print(f"[STATS] total_leads={len(leads)}", flush=True)
 
-        # OpenAI refinement
-        if openai_enabled() and lead.score >= CFG.medium_threshold and openai_calls < CFG.max_openai_calls:
-            ai = classify_lead(
-                lead_type_hint=lead.lead_type,
-                label=lead.company_or_person,
-                url=lead.final_url or lead.url,
-                title=lead.title,
-                snippet=lead.snippet,
-                page_text=lead.page_text,
-                model="gpt-5",
-            )
-            if ai:
-                bucket = ai.get("bucket")
-                if bucket in ("sponsor_licence", "global_mobility", "global_talent", "none"):
-                    if bucket == "none":
-                        lead.score = 0
-                        lead.reasons = ["AI triage: not a relevant immigration lead"]
-                    else:
-                        lead.lead_type = bucket
-                        lead.score = int(ai.get("score", lead.score))
-                        lead.reasons = ai.get("reasons", lead.reasons) or lead.reasons
+    # 4) Strong lead selection
+    sponsor_strong = [l for l in leads if l.bucket == "sponsor" and (l.score or 0) >= getattr(CFG, "min_score_sponsor", 70)]
+    mobility_strong = [l for l in leads if l.bucket == "mobility" and (l.score or 0) >= getattr(CFG, "min_score_mobility", 70)]
+    talent_strong = [l for l in leads if l.bucket == "talent" and (l.score or 0) >= getattr(CFG, "min_score_talent", 75)]
 
-                lead.ai_summary = ai.get("summary", "") or ""
-                lead.ai_outreach_angle = ai.get("outreach_angle", "") or ""
-                lead.ai_quote = ai.get("sponsorship_signal_quote", "") or ""
-                openai_calls += 1
+    # Prefer corporate emails (if present)
+    for l in sponsor_strong + mobility_strong + talent_strong:
+        if l.emails:
+            l.emails = sorted(l.emails, key=lambda e: (not _safe_company_domain(e), e))
 
-        # Mark seen
-        storage.mark_seen(lead_id, lead.lead_type, lead.title, lead.url, now_iso)
-
-        # Strong-lead gating (optional)
-        require_signal = bool(getattr(CFG, "require_company_signal_for_strong", False))
-
-        if lead.score >= CFG.strong_threshold:
-            if require_signal and lead.lead_type in ("sponsor_licence", "global_mobility"):
-                if not _has_company_signal(lead):
-                    continue
-
-            if lead.lead_type == "sponsor_licence":
-                sponsor_strong.append(lead)
-            elif lead.lead_type == "global_mobility":
-                mobility_strong.append(lead)
-            elif lead.lead_type == "global_talent":
-                talent_strong.append(lead)
-
-    sponsor_strong.sort(key=lambda x: x.score, reverse=True)
-    mobility_strong.sort(key=lambda x: x.score, reverse=True)
-    talent_strong.sort(key=lambda x: x.score, reverse=True)
-
-    sponsor_strong = sponsor_strong[:CFG.max_strong_per_bucket]
-    mobility_strong = mobility_strong[:CFG.max_strong_per_bucket]
-    talent_strong = talent_strong[:CFG.max_strong_per_bucket]
-
-    print(f"[STATS] processed={processed} skipped_seen={skipped_seen} pages_fetched={pages_fetched} openai_calls={openai_calls}")
-    print(f"[LEADS] sponsor_strong={len(sponsor_strong)} mobility_strong={len(mobility_strong)} talent_strong={len(talent_strong)}")
+    print(f"[STATS] sponsor_strong={len(sponsor_strong)} mobility_strong={len(mobility_strong)} talent_strong={len(talent_strong)}", flush=True)
 
     subject = f"CW Weekly Leads — {datetime.utcnow().strftime('%Y-%m-%d')}"
     if src_date:
         subject += f" (SponsorReg {src_date})"
 
+    _set_step("build email")
     html = build_email(sponsor_strong, mobility_strong, talent_strong)
 
-    print("[EMAIL] sending…")
+    print("[EMAIL] sending…", flush=True)
+    _set_step("send email")
     send_email(subject, html)
-    print("[EMAIL] sent")
+    print("[EMAIL] sent", flush=True)
 
     end = datetime.utcnow()
-    print(f"[DONE] finished @ {end.isoformat()}Z (duration {(end-start).total_seconds():.1f}s)")
+    print(f"[DONE] finished @ {end.isoformat()}Z (duration {(end-start).total_seconds():.1f}s)", flush=True)
 
 
 if __name__ == "__main__":
