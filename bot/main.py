@@ -1,3 +1,6 @@
+# bot/main.py
+# Drop-in replacement: fixes enrichment starvation + runs job intent earlier + keeps indentation correct.
+
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List
@@ -130,7 +133,6 @@ def main():
             except Exception:
                 psc_items = []
 
-        # Initial score (pre-enrichment); updated once we discover website + hiring signals.
         score, why_list, countries = compute_score(
             cfg,
             source="COMPANIES_HOUSE",
@@ -183,8 +185,8 @@ def main():
         k = l["lead_key"]
         if k not in best or l.get("score", 0) > best[k].get("score", 0):
             best[k] = l
-
     leads = list(best.values())
+
     leads.sort(
         key=lambda x: (x.get("score", 0), x.get("source", "") != "SPONSOR_REGISTER"),
         reverse=True,
@@ -195,15 +197,13 @@ def main():
     verified_sites = 0
 
     if serp_key:
-        # Stage A: discover likely official homepage candidates using SerpAPI
         stage_a = [l for l in leads if l.get("company_name")][: cfg.serp_stage_a_limit]
 
         for l in stage_a:
             if serp_budget["calls"] >= serp_budget["cap"]:
                 break
 
-            # Allow enrichment for top WATCH leads; Serp is what creates intent signals.
-            # Only skip very low-scoring noise to save budget.
+            # IMPORTANT: do NOT starve enrichment. Lower threshold so more leads get Serp discovery.
             if l.get("score", 0) < 6 and l.get("source") != "SPONSOR_REGISTER":
                 continue
 
@@ -220,7 +220,24 @@ def main():
             if candidates:
                 l["_homepage_candidates"] = candidates
 
-        # Stage B: scrape verified contacts from the best homepage candidates
+                # NEW: run hiring intent early (even before verification), so “hot” leads can appear.
+                ji, jr, jurls = score_hiring_intent(
+                    session,
+                    cfg,
+                    serp_key,
+                    company_name=l.get("company_name", ""),
+                    website=candidates[0] if candidates else "",
+                    serp_sleep=cfg.serp_sleep_seconds,
+                    serp_budget=serp_budget,
+                )
+                if ji:
+                    l["job_intent"] = max(l.get("job_intent", 0), ji)
+                    l["job_sources"] = ", ".join(jurls)
+                    l["score"] = min(100, int(l.get("score", 0)) + int(ji))
+                    l["why"] = (l.get("why", "") + "; " + "; ".join(jr)).strip("; ")
+                    l["bucket"] = bucket_from_score(cfg, int(l["score"]))
+                    store.upsert_lead(l)
+
         stage_b = [l for l in leads if l.get("_homepage_candidates")][: cfg.serp_stage_b_limit]
 
         for l in stage_b:
@@ -241,23 +258,22 @@ def main():
                 l["website_confidence"] = conf
                 l["contact_source_url"] = src
 
-                # Hiring intent scan (snippets only)
-                ji, jr, jurls = score_hiring_intent(
-                    session,
-                    cfg,
-                    serp_key,
-                    company_name=l.get("company_name", ""),
-                    website=website,
-                    serp_sleep=cfg.serp_sleep_seconds,
-                    serp_budget=serp_budget,
-                )
-
-                if ji:
-                    l["job_intent"] = ji
-                    l["job_sources"] = ", ".join(jurls)
-                    # Boost score with intent; keep within 0..100
-                    l["score"] = min(100, int(l.get("score", 0)) + int(ji))
-                    l["why"] = (l.get("why", "") + "; " + "; ".join(jr)).strip("; ")
+                # If we didn’t get job intent in stage A, try again now with the confirmed website
+                if not l.get("job_intent"):
+                    ji, jr, jurls = score_hiring_intent(
+                        session,
+                        cfg,
+                        serp_key,
+                        company_name=l.get("company_name", ""),
+                        website=website,
+                        serp_sleep=cfg.serp_sleep_seconds,
+                        serp_budget=serp_budget,
+                    )
+                    if ji:
+                        l["job_intent"] = ji
+                        l["job_sources"] = ", ".join(jurls)
+                        l["score"] = min(100, int(l.get("score", 0)) + int(ji))
+                        l["why"] = (l.get("why", "") + "; " + "; ".join(jr)).strip("; ")
 
                 # Only publish contacts once verification threshold is met
                 if conf >= cfg.verify_min_score:
@@ -265,8 +281,8 @@ def main():
                     l["phones"] = phones
                     verified_sites += 1
                     l["score"] = min(100, int(l.get("score", 0)) + 4)
-                    l["bucket"] = bucket_from_score(cfg, int(l["score"]))
 
+                l["bucket"] = bucket_from_score(cfg, int(l["score"]))
                 store.upsert_lead(l)
                 break
 
