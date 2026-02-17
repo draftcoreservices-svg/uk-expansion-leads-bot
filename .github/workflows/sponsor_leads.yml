@@ -1,4 +1,4 @@
-name: UK Expansion Leads Bot
+name: Sponsor Licence Leads Bot
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .cache
-          key: uk-expansion-leads-bot-cache-v2
+          key: sponsor-licence-leads-bot-cache-v1
 
       - name: Install dependencies
         run: |
@@ -30,6 +30,7 @@ jobs:
         env:
           COMPANIES_HOUSE_API_KEY: ${{ secrets.COMPANIES_HOUSE_API_KEY }}
           SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_API_KEY }} # safety alias
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -37,6 +38,14 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           MAX_OUTPUT_LEADS: ${{ secrets.MAX_OUTPUT_LEADS }}
+
+          # Tuning knobs (read by bot/config.py)
+          LOOKBACK_DAYS: "180"
+          SERP_STAGE_A_LIMIT: "80"
+          SERP_STAGE_B_LIMIT: "40"
+          VERIFY_MIN_SCORE: "4"
+          SERP_MAX_CALLS_PER_RUN: "120"
+
         run: |
-          python -c "import os; k=os.getenv('SERPAPI_API_KEY',''); print('SERPAPI_API_KEY length:', len(k))"
+          python -c "import os; k=os.environ.get('SERPAPI_API_KEY',''); print('SERPAPI_API_KEY length:', len(k))"
           python -m bot.main
