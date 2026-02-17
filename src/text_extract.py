@@ -1,38 +1,63 @@
 import re
-import time
-import requests
-from bs4 import BeautifulSoup
 from typing import Tuple
 
+import requests
+from bs4 import BeautifulSoup
 
-DEFAULT_TIMEOUT = (10, 30)  # (connect, read)
+DEFAULT_TIMEOUT = (10, 60)
 
 
-def fetch_page_text(url: str, max_chars: int = 12000) -> Tuple[str, str]:
-    """Fetch a URL and return (final_url, cleaned_text_excerpt).
+def _clean_text(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
-    Uses conservative timeouts + a small retry to avoid CI hangs.
-    """
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; CWLeadsBot/1.0)"}
-    last_err: Exception | None = None
 
-    for attempt in range(2):
+def _extract_visible_text_from_html(html: str) -> str:
+    soup = BeautifulSoup(html or "", "lxml")
+
+    # Remove obvious non-content
+    for tag in soup(["script", "style", "noscript", "svg", "canvas", "iframe"]):
         try:
-            r = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
-            r.raise_for_status()
-            final_url = r.url
+            tag.decompose()
+        except Exception:
+            pass
 
-            soup = BeautifulSoup(r.text, "lxml")
-            for tag in soup(["script", "style", "noscript"]):
-                tag.decompose()
+    # Get text
+    text = soup.get_text(separator=" ")
+    return _clean_text(text)
 
-            text = soup.get_text(" ", strip=True)
-            text = re.sub(r"\s+", " ", text).strip()
-            if len(text) > max_chars:
-                text = text[:max_chars]
-            return final_url, text
-        except Exception as e:
-            last_err = e
-            time.sleep(1.0)
 
-    raise last_err  # type: ignore
+def fetch_page(url: str, max_chars: int = 12000) -> Tuple[str, str, str]:
+    """
+    Fetch a web page and return:
+      (final_url, visible_text, html)
+
+    This is the function src.run_weekly expects.
+    """
+    if not url:
+        raise ValueError("URL is empty")
+
+    r = requests.get(
+        url,
+        timeout=DEFAULT_TIMEOUT,
+        headers={"User-Agent": "Mozilla/5.0 (CWLeadsBot/1.0)"},
+        allow_redirects=True,
+    )
+    r.raise_for_status()
+
+    final_url = str(r.url)
+    html = r.text or ""
+    text = _extract_visible_text_from_html(html)
+
+    if max_chars and len(text) > max_chars:
+        text = text[:max_chars]
+
+    return final_url, text, html
+
+
+# Backwards compatibility (in case other modules import older names)
+def fetch_text(url: str, max_chars: int = 12000) -> Tuple[str, str]:
+    final_url, text, _html = fetch_page(url, max_chars=max_chars)
+    return final_url, text
