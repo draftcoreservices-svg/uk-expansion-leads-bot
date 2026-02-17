@@ -128,4 +128,68 @@ def main():
         if lead.lead_type in ("sponsor_licence", "global_mobility"):
             try:
                 lead.companies_house = ch.search_company(lead.company_or_person)
-            except Excep
+            except Exception:
+                lead.companies_house = None
+
+        # 8) Heuristic score
+        lead = score_heuristic(lead)
+
+        # 9) OpenAI refinement (only if enabled, and only if heuristic is at least medium-ish)
+        # This reduces false positives and produces a paralegal-style summary.
+        if openai_enabled() and lead.score >= CFG.medium_threshold and openai_calls < CFG.max_openai_calls:
+            ai = classify_lead(
+                lead_type_hint=lead.lead_type,
+                label=lead.company_or_person,
+                url=lead.final_url or lead.url,
+                title=lead.title,
+                snippet=lead.snippet,
+                page_text=lead.page_text,
+                model="gpt-5",
+            )
+            if ai:
+                # Allow AI to re-bucket if it’s clearly misclassified
+                bucket = ai.get("bucket")
+                if bucket in ("sponsor_licence", "global_mobility", "global_talent", "none"):
+                    if bucket == "none":
+                        lead.score = 0
+                        lead.reasons = ["AI triage: not a relevant immigration lead"]
+                    else:
+                        lead.lead_type = bucket
+                        lead.score = int(ai.get("score", lead.score))
+                        lead.reasons = ai.get("reasons", lead.reasons) or lead.reasons
+
+                lead.ai_summary = ai.get("summary", "") or ""
+                lead.ai_outreach_angle = ai.get("outreach_angle", "") or ""
+                lead.ai_quote = ai.get("sponsorship_signal_quote", "") or ""
+                openai_calls += 1
+
+        # 10) Mark seen
+        storage.mark_seen(lead_id, lead.lead_type, lead.title, lead.url, now_iso)
+
+        # 11) Add strong leads to buckets
+        if lead.score >= CFG.strong_threshold:
+            if lead.lead_type == "sponsor_licence":
+                sponsor_strong.append(lead)
+            elif lead.lead_type == "global_mobility":
+                mobility_strong.append(lead)
+            elif lead.lead_type == "global_talent":
+                talent_strong.append(lead)
+
+    sponsor_strong.sort(key=lambda x: x.score, reverse=True)
+    mobility_strong.sort(key=lambda x: x.score, reverse=True)
+    talent_strong.sort(key=lambda x: x.score, reverse=True)
+
+    sponsor_strong = sponsor_strong[:CFG.max_strong_per_bucket]
+    mobility_strong = mobility_strong[:CFG.max_strong_per_bucket]
+    talent_strong = talent_strong[:CFG.max_strong_per_bucket]
+
+    subject = f"CW Leads — Sponsor/Mobility/Talent — {datetime.utcnow().strftime('%Y-%m-%d')}"
+    if src_date:
+        subject += f" (SponsorReg {src_date})"
+
+    html = build_email(sponsor_strong, mobility_strong, talent_strong)
+    send_email(subject, html)
+
+
+if __name__ == "__main__":
+    main()
