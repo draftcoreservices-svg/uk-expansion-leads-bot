@@ -20,11 +20,9 @@ def _denied(url: str) -> bool:
         u = urlparse(url)
         host = (u.netloc or "").lower()
 
-        # deny TLDs
         if any(host.endswith(tld) for tld in CFG.deny_tlds):
             return True
 
-        # deny domains
         for d in CFG.deny_domains:
             if host == d or host.endswith("." + d):
                 return True
@@ -35,7 +33,6 @@ def _denied(url: str) -> bool:
 
 
 def _label_from_title(title: str) -> str:
-    # best-effort: strip common separators
     if not title:
         return ""
     for sep in ["|", " - ", " — ", " · "]:
@@ -47,10 +44,16 @@ def _label_from_title(title: str) -> str:
 
 def _build_leads(serp: SerpClient, lead_type: str, queries: list[str]) -> list[Lead]:
     out: list[Lead] = []
-    for q in queries:
-        for r in serp.search(q, num=CFG.max_results_per_query):
+    print(f"[SERP] Building leads for {lead_type} — queries={len(queries)}")
+    for i, q in enumerate(queries, start=1):
+        print(f"[SERP] ({lead_type}) Query {i}/{len(queries)}: {q}")
+        results = serp.search(q, num=CFG.max_results_per_query)
+        print(f"[SERP] ({lead_type}) Got {len(results)} results")
+        for r in results:
             url = (r.get("link") or "").strip()
-            if not url or _denied(url):
+            if not url:
+                continue
+            if _denied(url):
                 continue
             out.append(
                 Lead(
@@ -61,28 +64,40 @@ def _build_leads(serp: SerpClient, lead_type: str, queries: list[str]) -> list[L
                     query=r.get("query", ""),
                 )
             )
+    print(f"[SERP] {lead_type} candidates after deny-filter: {len(out)}")
     return out
 
 
 def main():
-    storage = Storage("cache.sqlite")
-    serp = SerpClient()
-    ch = CompaniesHouseClient()
+    start = datetime.utcnow()
+    print(f"[START] CW weekly run @ {start.isoformat()}Z")
 
-    # 1) Refresh sponsor register (GOV.UK CSV)
+    storage = Storage("cache.sqlite")
+    print("[OK] Storage initialised")
+
+    serp = SerpClient()
+    print("[OK] SerpClient initialised")
+
+    ch = CompaniesHouseClient()
+    print("[OK] CompaniesHouseClient initialised")
+
+    # 1) Refresh sponsor register
     try:
         updated, src_date = refresh_sponsor_register(storage)
-    except Exception:
+        print(f"[SPONSOR-REG] refreshed={updated} source_date={src_date}")
+    except Exception as e:
+        print(f"[SPONSOR-REG] refresh failed (continuing): {repr(e)}")
         updated, src_date = (False, "")
 
     now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-    # 2) Gather raw candidates
+    # 2) Gather candidates
     raw_sponsor = _build_leads(serp, "sponsor_licence", CFG.sponsor_queries)
     raw_mobility = _build_leads(serp, "global_mobility", CFG.mobility_queries)
     raw_talent = _build_leads(serp, "global_talent", CFG.talent_queries)
 
     all_raw = raw_sponsor + raw_mobility + raw_talent
+    print(f"[TOTAL] total raw candidates: {len(all_raw)}")
 
     sponsor_strong: list[Lead] = []
     mobility_strong: list[Lead] = []
@@ -90,52 +105,57 @@ def main():
 
     pages_fetched = 0
     openai_calls = 0
+    processed = 0
+    skipped_seen = 0
 
     for lead in all_raw:
         lead_id = storage.lead_id(lead.lead_type, lead.url, lead.title)
         if storage.seen_before(lead_id):
+            skipped_seen += 1
             continue
 
         if pages_fetched >= CFG.max_pages_to_fetch:
+            print("[STOP] max_pages_to_fetch reached")
             break
 
-        # 3) Fetch page text
+        processed += 1
+
+        # Fetch page text
         try:
             final_url, text = fetch_page_text(lead.url, max_chars=CFG.page_text_max_chars)
             lead.final_url = final_url
             lead.page_text = text
             pages_fetched += 1
-        except Exception:
+        except Exception as e:
             storage.mark_seen(lead_id, lead.lead_type, lead.title, lead.url, now_iso)
             continue
 
-        # 4) Extract contacts
+        # Extract contacts
         emails, phones = extract_contacts(lead.page_text)
         lead.contact_emails = emails
         lead.contact_phones = phones
 
-        # 5) Label
+        # Label
         lead.company_or_person = _label_from_title(lead.title)
 
-        # 6) Sponsor register check (only relevant for sponsor bucket)
+        # Sponsor register check
         if lead.lead_type == "sponsor_licence":
             try:
                 lead.on_sponsor_register = is_on_sponsor_register(storage, lead.company_or_person)
             except Exception:
                 lead.on_sponsor_register = None
 
-        # 7) Companies House enrichment for org buckets
+        # Companies House enrichment
         if lead.lead_type in ("sponsor_licence", "global_mobility"):
             try:
                 lead.companies_house = ch.search_company(lead.company_or_person)
             except Exception:
                 lead.companies_house = None
 
-        # 8) Heuristic score
+        # Heuristic scoring
         lead = score_heuristic(lead)
 
-        # 9) OpenAI refinement (only if enabled, and only if heuristic is at least medium-ish)
-        # This reduces false positives and produces a paralegal-style summary.
+        # OpenAI refinement
         if openai_enabled() and lead.score >= CFG.medium_threshold and openai_calls < CFG.max_openai_calls:
             ai = classify_lead(
                 lead_type_hint=lead.lead_type,
@@ -147,7 +167,6 @@ def main():
                 model="gpt-5",
             )
             if ai:
-                # Allow AI to re-bucket if it’s clearly misclassified
                 bucket = ai.get("bucket")
                 if bucket in ("sponsor_licence", "global_mobility", "global_talent", "none"):
                     if bucket == "none":
@@ -163,10 +182,8 @@ def main():
                 lead.ai_quote = ai.get("sponsorship_signal_quote", "") or ""
                 openai_calls += 1
 
-        # 10) Mark seen
         storage.mark_seen(lead_id, lead.lead_type, lead.title, lead.url, now_iso)
 
-        # 11) Add strong leads to buckets
         if lead.score >= CFG.strong_threshold:
             if lead.lead_type == "sponsor_licence":
                 sponsor_strong.append(lead)
@@ -183,12 +200,21 @@ def main():
     mobility_strong = mobility_strong[:CFG.max_strong_per_bucket]
     talent_strong = talent_strong[:CFG.max_strong_per_bucket]
 
+    print(f"[STATS] processed={processed} skipped_seen={skipped_seen} pages_fetched={pages_fetched} openai_calls={openai_calls}")
+    print(f"[LEADS] sponsor_strong={len(sponsor_strong)} mobility_strong={len(mobility_strong)} talent_strong={len(talent_strong)}")
+
     subject = f"CW Leads — Sponsor/Mobility/Talent — {datetime.utcnow().strftime('%Y-%m-%d')}"
     if src_date:
         subject += f" (SponsorReg {src_date})"
 
     html = build_email(sponsor_strong, mobility_strong, talent_strong)
+
+    print("[EMAIL] sending…")
     send_email(subject, html)
+    print("[EMAIL] sent")
+
+    end = datetime.utcnow()
+    print(f"[DONE] finished @ {end.isoformat()}Z (duration {(end-start).total_seconds():.1f}s)")
 
 
 if __name__ == "__main__":
