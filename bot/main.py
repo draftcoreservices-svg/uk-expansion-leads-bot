@@ -18,22 +18,35 @@ from email import encoders
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# =========================
-# Config (tuneable)
-# =========================
+# ============================================================
+# CONFIG (tuneable)
+# ============================================================
 
-MAX_OUTPUT_LEADS = 20          # cap to keep SerpAPI usage low
-LOOKBACK_DAYS = 10             # Companies House incorporation window
-SERP_MAX_CALLS_PER_RUN = 60    # hard safety cap (free plan throughput)
-SERP_SLEEP_SECONDS = 1.5       # rate limiting for SerpAPI free tier
-VERIFY_MIN_SCORE = 7           # confidence gating threshold (0-10)
+MAX_OUTPUT_LEADS = 20            # email/report cap (and enrichment cap)
+LOOKBACK_DAYS = 10               # Companies House incorporation window
+VERIFY_MIN_SCORE = 7             # confidence gating threshold (0-10)
 
-# Speed/robustness caps for Companies House
-CH_MAX_COMPANIES_TO_CHECK = 120   # hard cap per run (keeps runtime sane)
-CH_MAX_RESULTS_TOTAL = 600        # cap pagination (max items pulled = this)
-CH_OFFICERS_TIMEOUT = 15          # seconds
-CH_SEARCH_TIMEOUT = 20            # seconds
-CH_RETRY_COUNT = 3                # for transient errors (429/5xx)
+# SerpAPI controls
+SERP_MAX_CALLS_PER_RUN = 80      # safety cap (free tier friendly)
+SERP_SLEEP_SECONDS = 1.2         # rate limiting
+
+# Companies House speed caps
+CH_MAX_COMPANIES_TO_CHECK = 120  # max incorporations processed per run
+CH_MAX_RESULTS_TOTAL = 600       # max incorporations pulled from advanced search
+CH_OFFICERS_TIMEOUT = 15         # seconds
+CH_SEARCH_TIMEOUT = 20           # seconds
+CH_RETRY_COUNT = 3
+
+# Sponsor register route filters (keep the commercial ones)
+SPONSOR_ROUTE_ALLOWLIST = {
+    "Skilled Worker",
+    "Global Business Mobility: Senior or Specialist Worker",
+    "Global Business Mobility: UK Expansion Worker",
+}
+
+# Optional: ignore very small/noisy sponsor names
+MIN_CLEAN_NAME_LEN = 3
+MAX_NON_ALNUM_RATIO = 0.35
 
 PRIORITY_COUNTRIES = {
     "US","USA","UNITED STATES","CANADA","UAE","UNITED ARAB EMIRATES","INDIA","AUSTRALIA",
@@ -42,9 +55,9 @@ PRIORITY_COUNTRIES = {
     "ROMANIA","BULGARIA","HUNGARY"
 }
 
-# =========================
-# Constants
-# =========================
+# ============================================================
+# CONSTANTS
+# ============================================================
 
 CACHE_DIR = ".cache"
 DB_PATH = os.path.join(CACHE_DIR, "state.db")
@@ -71,11 +84,12 @@ EMAIL_STYLE = """
   .small { font-size:12px; color:#374151; margin-top:3px; }
   a { color:#0b5bd3; text-decoration:none; }
   .footer { font-size:11px; color:#6b7280; margin-top:12px; }
+  .note { background:#f8fafc; border:1px solid #e7ecf3; padding:10px; border-radius:10px; font-size:12px; color:#374151; }
 """
 
-# =========================
-# Session / retries
-# =========================
+# ============================================================
+# SESSION / RETRIES
+# ============================================================
 
 def make_session() -> requests.Session:
     s = requests.Session()
@@ -90,9 +104,9 @@ def make_session() -> requests.Session:
     s.mount("http://", adapter)
     return s
 
-# =========================
-# Helpers
-# =========================
+# ============================================================
+# HELPERS
+# ============================================================
 
 def utc_now():
     return datetime.now(timezone.utc).replace(microsecond=0)
@@ -101,6 +115,7 @@ def ensure_db():
     os.makedirs(CACHE_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("CREATE TABLE IF NOT EXISTS seen (key TEXT PRIMARY KEY, first_seen_utc TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
     conn.commit()
     return conn
 
@@ -111,6 +126,14 @@ def is_seen(conn, key: str) -> bool:
 def mark_seen(conn, key: str, ts: str):
     conn.execute("INSERT OR IGNORE INTO seen(key, first_seen_utc) VALUES(?,?)", (key, ts))
 
+def meta_get(conn, k: str) -> str | None:
+    cur = conn.execute("SELECT v FROM meta WHERE k=?", (k,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+def meta_set(conn, k: str, v: str):
+    conn.execute("INSERT INTO meta(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+
 def ch_auth():
     return (os.environ["COMPANIES_HOUSE_API_KEY"], "")
 
@@ -119,6 +142,19 @@ def norm(s: str) -> str:
 
 def norm_upper(s: str) -> str:
     return norm(s).upper()
+
+def clean_display_name(name: str) -> str:
+    n = norm(name)
+    # remove leading junk punctuation / quotes / backticks etc
+    n = re.sub(r"^[\s\"\'\`\*\@\[\]\(\)\{\}\<\>\#\!\$\%\^\&\=\+\;\:\,\.\-\/\\]+", "", n)
+    n = re.sub(r"\s+", " ", n).strip()
+    return n
+
+def non_alnum_ratio(s: str) -> float:
+    if not s:
+        return 1.0
+    non = sum(1 for ch in s if not ch.isalnum() and ch != " ")
+    return non / max(len(s), 1)
 
 def extract_emails(text: str) -> list[str]:
     if not text:
@@ -151,18 +187,16 @@ def extract_phones(text: str) -> list[str]:
         out.append(c)
     return out[:5]
 
-# =========================
-# Sponsor register
-# =========================
+# ============================================================
+# SPONSOR REGISTER
+# ============================================================
 
 def find_latest_csv_url(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
     links = []
     for a in soup.select("a[href]"):
         href = a.get("href")
-        if not href:
-            continue
-        if ".csv" in href.lower():
+        if href and ".csv" in href.lower():
             links.append(href)
     if not links:
         raise RuntimeError("Could not find CSV link on sponsor register page.")
@@ -186,11 +220,32 @@ def sponsor_row_key(row: dict) -> str:
     name = norm_upper(row.get("Organisation Name") or row.get("Organization Name") or "")
     town = norm_upper(row.get("Town/City") or row.get("Town") or "")
     route = norm_upper(row.get("Route") or "")
-    return f"SPONSOR::{name}::{town}::{route}"
+    sub = norm_upper(row.get("Sub Route") or "")
+    return f"SPONSOR::{name}::{town}::{route}::{sub}"
 
-# =========================
-# Companies House
-# =========================
+def sponsor_row_fields(row: dict) -> dict:
+    raw_name = row.get("Organisation Name") or row.get("Organization Name") or ""
+    name = clean_display_name(raw_name)
+
+    town = norm(row.get("Town/City") or row.get("Town") or "")
+    county = norm(row.get("County") or "")
+    route = norm(row.get("Route") or "")
+    sub = norm(row.get("Sub Route") or "")
+
+    addr = ", ".join([x for x in [town, county] if x]).strip(", ")
+    return {"name": name, "town": town, "county": county, "address": addr, "route": route, "subroute": sub, "raw_name": raw_name}
+
+def sponsor_is_noise(name: str) -> bool:
+    n = clean_display_name(name)
+    if len(n) < MIN_CLEAN_NAME_LEN:
+        return True
+    if non_alnum_ratio(n) > MAX_NON_ALNUM_RATIO:
+        return True
+    return False
+
+# ============================================================
+# COMPANIES HOUSE
+# ============================================================
 
 def ch_advanced_incorporated(session: requests.Session, inc_from: str, inc_to: str, size: int = 100) -> list[dict]:
     out = []
@@ -232,6 +287,58 @@ def ch_company_officers(session: requests.Session, company_number: str) -> list[
     r.raise_for_status()
     return r.json().get("items") or []
 
+def ch_company_profile(session: requests.Session, company_number: str) -> dict:
+    r = session.get(
+        f"{CH_BASE}/company/{company_number}",
+        auth=ch_auth(),
+        timeout=CH_SEARCH_TIMEOUT,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def ch_search_companies(session: requests.Session, query: str, items_per_page: int = 10) -> list[dict]:
+    r = session.get(
+        f"{CH_BASE}/search/companies",
+        params={"q": query, "items_per_page": items_per_page},
+        auth=ch_auth(),
+        timeout=CH_SEARCH_TIMEOUT,
+    )
+    r.raise_for_status()
+    return r.json().get("items") or []
+
+def best_ch_match_for_sponsor(session: requests.Session, sponsor_name: str, town: str) -> tuple[str, int]:
+    """
+    Returns (company_number, confidence_score out of 100)
+    """
+    q = sponsor_name
+    items = ch_search_companies(session, q, items_per_page=10)
+    if not items:
+        return "", 0
+
+    best_num = ""
+    best_score = 0
+    town_u = norm_upper(town)
+
+    for it in items:
+        title = it.get("title") or ""
+        num = it.get("company_number") or ""
+        if not num or not title:
+            continue
+
+        # similarity 0..100
+        sim = fuzz.token_set_ratio(norm_upper(sponsor_name), norm_upper(title))
+
+        # small boost if the company address snippet contains town
+        snippet = norm_upper(it.get("address_snippet") or "")
+        if town_u and town_u in snippet:
+            sim = min(100, sim + 6)
+
+        if sim > best_score:
+            best_score = sim
+            best_num = num
+
+    return best_num, best_score
+
 def overseas_signal_score(officers: list[dict]) -> tuple[int, list[str], list[str]]:
     reasons = []
     countries = []
@@ -257,15 +364,6 @@ def overseas_signal_score(officers: list[dict]) -> tuple[int, list[str], list[st
 
     return min(score, 10), reasons, sorted(set(countries))
 
-def visa_hint(source: str, score: int) -> str:
-    if source == "SPONSOR_REGISTER":
-        return "Sponsor compliance / Skilled Worker routes"
-    if score >= 7:
-        return "UK Expansion Worker likely (overseas-linked incorporation)"
-    if score >= 5:
-        return "Possible Expansion Worker / Sponsor needs (review)"
-    return "Watchlist"
-
 def commercial_bucket(score: int) -> str:
     if score >= 8:
         return "HOT"
@@ -273,9 +371,25 @@ def commercial_bucket(score: int) -> str:
         return "MEDIUM"
     return "WATCH"
 
-# =========================
-# SerpAPI enrichment + verification
-# =========================
+def visa_hint(source: str, score: int, route: str = "") -> str:
+    if source == "SPONSOR_REGISTER":
+        if "UK Expansion Worker" in route:
+            return "Likely UK Expansion Worker / Sponsor compliance"
+        if "Senior or Specialist Worker" in route:
+            return "GBM Senior/Specialist Worker route"
+        if "Skilled Worker" in route:
+            return "Sponsor compliance / Skilled Worker routes"
+        return "Sponsor compliance / worker routes"
+    # Companies House
+    if score >= 7:
+        return "UK Expansion Worker likely (overseas-linked incorporation)"
+    if score >= 5:
+        return "Possible Expansion Worker / Sponsor needs (review)"
+    return "Watchlist"
+
+# ============================================================
+# SERPAPI + WEBSITE VERIFICATION + CONTACT EXTRACTION
+# ============================================================
 
 def serp_search(session: requests.Session, query: str, api_key: str, num: int = 5) -> list[dict]:
     params = {"engine": "google", "q": query, "api_key": api_key, "num": num}
@@ -294,7 +408,7 @@ def get_url_text(session: requests.Session, url: str, timeout: int = 20) -> str:
         r = session.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 (compatible; CWLeadsBot/1.0)"})
         if r.status_code >= 400:
             return ""
-        return (r.text or "")[:500000]
+        return (r.text or "")[:600000]
     except Exception:
         return ""
 
@@ -367,9 +481,11 @@ def enrich_lead_with_contact(http: requests.Session, lead: dict, serp_key: str, 
     reg_postcode = lead.get("reg_postcode", "")
     town = lead.get("reg_town", "")
 
-    q = f"\"{company_name}\" {reg_postcode}".strip()
+    # Better query: name + postcode (if known) else name + town
+    q = f"\"{company_name}\" {reg_postcode}".strip() if reg_postcode else f"\"{company_name}\" {town} contact".strip()
+
     serp_budget["calls"] += 1
-    results = serp_search(http, q, serp_key, num=5)
+    results = serp_search(http, q, serp_key, num=6)
     time.sleep(SERP_SLEEP_SECONDS)
 
     candidates = []
@@ -380,27 +496,18 @@ def enrich_lead_with_contact(http: requests.Session, lead: dict, serp_key: str, 
         d = url_domain(link)
         if not d:
             continue
-        if any(x in d for x in ["companieshouse.gov.uk","gov.uk","linkedin.com","facebook.com","yell.com","endole.co.uk","opencorporates.com","find-and-update.company-information.service.gov.uk"]):
+        # Skip obvious directories / non-official sources
+        if any(x in d for x in [
+            "companieshouse.gov.uk","gov.uk","linkedin.com","facebook.com","yell.com","endole.co.uk",
+            "opencorporates.com","find-and-update.company-information.service.gov.uk","uk.linkedin.com",
+            "bloomberg.com","dnb.com","zoominfo.com","crunchbase.com"
+        ]):
             continue
         candidates.append(link)
 
-    if not candidates and town:
-        q2 = f"\"{company_name}\" {town} contact"
-        serp_budget["calls"] += 1
-        results2 = serp_search(http, q2, serp_key, num=5)
-        time.sleep(SERP_SLEEP_SECONDS)
-        for r in results2:
-            link = r.get("link") or ""
-            if not link.startswith("http"):
-                continue
-            d = url_domain(link)
-            if not d or any(x in d for x in ["companieshouse.gov.uk","gov.uk","linkedin.com","facebook.com"]):
-                continue
-            candidates.append(link)
-
     candidates = candidates[:3]
 
-    best = {"score": -1, "base_url": "", "evidence": [], "emails": [], "phones": []}
+    best = {"score": -1, "base_url": "", "evidence": []}
 
     for url in candidates:
         base_url = "https://" + url_domain(url)
@@ -435,6 +542,7 @@ def enrich_lead_with_contact(http: requests.Session, lead: dict, serp_key: str, 
         lead["enrich_status"] = "Manual verify needed (confidence too low)"
         return lead
 
+    # Scrape only if verified
     combined_text = ""
     home_html = get_url_text(http, best["base_url"])
     combined_text += " " + BeautifulSoup(home_html, "lxml").get_text(" ", strip=True)
@@ -453,9 +561,9 @@ def enrich_lead_with_contact(http: requests.Session, lead: dict, serp_key: str, 
     lead["enrich_status"] = "Verified & scraped" if (emails or phones) else "Verified (no contacts found)"
     return lead
 
-# =========================
-# Email
-# =========================
+# ============================================================
+# EMAIL
+# ============================================================
 
 def send_email(subject: str, html: str, csv_bytes: bytes, csv_filename: str):
     host = os.environ["SMTP_HOST"]
@@ -496,6 +604,11 @@ def html_report(run_meta: dict, leads: list[dict]) -> str:
         bucket = l.get("bucket", "WATCH")
         website = l.get("website") or ""
         website_html = f"<a href='{website}'>{website}</a>" if website else "—"
+        route = l.get("sponsor_route") or ""
+        route_html = f"<div class='small'><span class='k'>Route:</span> {route}</div>" if route else ""
+        verify_ev = l.get("verification_evidence") or ""
+        verify_html = f"<div class='small'><span class='k'>Verify:</span> {verify_ev}</div>" if verify_ev else ""
+
         rows += f"""
         <tr>
           <td>{fmt_pill(bucket)}<div class="small">{l.get('source','')}</div></td>
@@ -503,6 +616,7 @@ def html_report(run_meta: dict, leads: list[dict]) -> str:
             <div class="v">{l.get('company_name','')}</div>
             <div class="k">Company No: {l.get('company_number','') or '—'} · Incorporated: {l.get('incorporated','') or '—'}</div>
             <div class="small">{l.get('reg_address','')}</div>
+            {route_html}
           </td>
           <td>
             <div class="v">{l.get('visa_hint','')}</div>
@@ -515,8 +629,18 @@ def html_report(run_meta: dict, leads: list[dict]) -> str:
             <div class="small">{l.get('enrich_status','')}</div>
             <div class="small">{l.get('emails_found','')}</div>
             <div class="small">{l.get('phones_found','')}</div>
+            {verify_html}
           </td>
         </tr>
+        """
+
+    sponsor_note = ""
+    if run_meta.get("sponsor_baselined") == "1":
+        sponsor_note = """
+        <div class="note" style="margin-top:12px;">
+          <b>First run baseline:</b> Sponsor Register is treated as a baseline snapshot on the first run.
+          New sponsors will only be reported on subsequent runs.
+        </div>
         """
 
     html = f"""
@@ -529,13 +653,15 @@ def html_report(run_meta: dict, leads: list[dict]) -> str:
             <div class="muted">
               Run time (UTC): {run_meta.get('run_time_utc','')}<br/>
               Lookback: {run_meta.get('lookback','')}<br/>
-              New sponsors detected: {run_meta.get('new_sponsors',0)} · Overseas-signal incorporations: {run_meta.get('new_ch_candidates',0)} · Verified websites: {run_meta.get('verified_sites',0)} · Serp calls: {run_meta.get('serp_calls',0)}
+              New sponsors (filtered routes): {run_meta.get('new_sponsors',0)} · CH overseas-signal incorporations: {run_meta.get('new_ch_candidates',0)}
+              · Verified websites: {run_meta.get('verified_sites',0)} · Serp calls: {run_meta.get('serp_calls',0)}
             </div>
           </div>
 
           <div class="card">
             <div class="v">Top leads (capped to {MAX_OUTPUT_LEADS})</div>
-            <div class="small">Only verified company websites are scraped for public contact details (confidence gating).</div>
+            <div class="small">Sponsor leads are matched to Companies House where possible, then verified before scraping contact details.</div>
+            {sponsor_note}
             <table>
               <thead>
                 <tr>
@@ -559,9 +685,9 @@ def html_report(run_meta: dict, leads: list[dict]) -> str:
     """
     return html
 
-# =========================
-# Main
-# =========================
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
     serp_key = os.environ.get("SERPAPI_API_KEY", "").strip()
@@ -574,25 +700,57 @@ def main():
     run_ts_iso = run_ts.isoformat()
     conn = ensure_db()
 
-    # -------- Sponsors: diff against seen keys
+    # ------------------------------------------------------------
+    # 1) Sponsor Register: baseline on first run; diff afterwards
+    # ------------------------------------------------------------
     sponsor_error = ""
-    new_sponsor_rows = []
+    sponsor_new = []
+    sponsor_total_filtered = 0
+    sponsor_baselined = meta_get(conn, "sponsor_baselined") or "0"
+
     try:
         print("[SPONSOR] Fetching GOV.UK sponsor CSV…", flush=True)
         sponsor_df = fetch_sponsor_df(http)
-        sponsor_records = sponsor_df.to_dict(orient="records")
-        print(f"[SPONSOR] Loaded {len(sponsor_records)} rows.", flush=True)
-        for row in sponsor_records:
-            key = sponsor_row_key(row)
-            if not is_seen(conn, key):
+        records = sponsor_df.to_dict(orient="records")
+        print(f"[SPONSOR] Loaded {len(records)} rows.", flush=True)
+
+        filtered = []
+        for row in records:
+            f = sponsor_row_fields(row)
+            route = f["route"]
+            if route not in SPONSOR_ROUTE_ALLOWLIST:
+                continue
+            if sponsor_is_noise(f["name"]):
+                continue
+            filtered.append((row, f))
+
+        sponsor_total_filtered = len(filtered)
+        print(f"[SPONSOR] Filtered to {sponsor_total_filtered} rows (route allowlist + name cleanup).", flush=True)
+
+        # First run: baseline snapshot (mark all as seen; report 0 new)
+        if sponsor_baselined != "1":
+            for row, f in filtered:
+                key = sponsor_row_key(row)
                 mark_seen(conn, key, run_ts_iso)
-                new_sponsor_rows.append(row)
-        print(f"[SPONSOR] New sponsor rows detected: {len(new_sponsor_rows)}", flush=True)
+            meta_set(conn, "sponsor_baselined", "1")
+            sponsor_baselined = "1"
+            sponsor_new = []
+            print("[SPONSOR] First run: baselined sponsor register. New sponsors = 0.", flush=True)
+        else:
+            for row, f in filtered:
+                key = sponsor_row_key(row)
+                if not is_seen(conn, key):
+                    mark_seen(conn, key, run_ts_iso)
+                    sponsor_new.append((row, f))
+            print(f"[SPONSOR] New sponsor rows (filtered) detected: {len(sponsor_new)}", flush=True)
+
     except Exception as e:
         sponsor_error = str(e)
         print(f"[SPONSOR] ERROR: {sponsor_error}", flush=True)
 
-    # -------- Companies House: lookback window
+    # ------------------------------------------------------------
+    # 2) Companies House: overseas-signal incorporations
+    # ------------------------------------------------------------
     inc_to = run_ts.date().isoformat()
     inc_from = (run_ts.date() - timedelta(days=LOOKBACK_DAYS)).isoformat()
 
@@ -609,7 +767,7 @@ def main():
             print(f"[CH] Officers lookup progress: {idx}/{len(ch_items)}", flush=True)
 
         company_number = item.get("company_number") or ""
-        company_name = item.get("company_name") or ""
+        company_name = clean_display_name(item.get("company_name") or "")
         if not company_number or not company_name:
             continue
 
@@ -649,40 +807,98 @@ def main():
             "score": score,
             "why": "; ".join(reasons),
             "countries": ", ".join(countries),
+            "sponsor_route": "",
         })
 
-        # mark as seen so we don't re-notify endlessly if enrichment fails
         mark_seen(conn, key, run_ts_iso)
 
     print(f"[CH] Overseas-signal candidates: {len(ch_candidates)}", flush=True)
 
-    # Sponsor leads formatting
+    # ------------------------------------------------------------
+    # 3) Convert sponsor_new → leads and attempt CH match for enrichment
+    # ------------------------------------------------------------
     sponsor_leads = []
-    for r in new_sponsor_rows:
-        name = norm(r.get("Organisation Name") or r.get("Organization Name") or "")
-        town = norm(r.get("Town/City") or r.get("Town") or "")
-        county = norm(r.get("County") or "")
-        route = norm(r.get("Route") or "")
-        sub = norm(r.get("Sub Route") or "")
-        addr = ", ".join([x for x in [town, county] if x])
+    if sponsor_new:
+        print("[SPONSOR→CH] Matching new sponsors to Companies House…", flush=True)
+
+    for idx, (row, f) in enumerate(sponsor_new, start=1):
+        if idx == 1 or idx % 10 == 0:
+            print(f"[SPONSOR→CH] Progress: {idx}/{len(sponsor_new)}", flush=True)
+
+        name = f["name"]
+        town = f["town"]
+        route = f["route"]
+        sub = f["subroute"]
+        route_display = route + (f" / {sub}" if sub else "")
+
+        # CH match attempt
+        company_number = ""
+        ch_match_conf = 0
+        reg_address = f["address"]
+        reg_postcode = ""
+        incorporated = ""
+
+        try:
+            company_number, ch_match_conf = best_ch_match_for_sponsor(http, name, town)
+            if company_number and ch_match_conf >= 72:
+                prof = ch_company_profile(http, company_number)
+                ro = prof.get("registered_office_address") or {}
+                reg_postcode = norm(ro.get("postal_code",""))
+                incorporated = prof.get("date_of_creation","")
+                reg_address = ", ".join([x for x in [
+                    ro.get("address_line_1",""),
+                    ro.get("address_line_2",""),
+                    ro.get("locality",""),
+                    ro.get("region",""),
+                    ro.get("postal_code",""),
+                    ro.get("country",""),
+                ] if x]).strip(", ")
+        except Exception:
+            company_number = ""
+            ch_match_conf = 0
+
         sponsor_leads.append({
             "source": "SPONSOR_REGISTER",
             "company_name": name,
-            "company_number": "",
-            "incorporated": "",
-            "reg_address": addr,
-            "reg_postcode": "",
+            "company_number": company_number,
+            "incorporated": incorporated,
+            "reg_address": reg_address,
+            "reg_postcode": reg_postcode,
             "reg_town": town,
-            "score": 6,
-            "why": f"Newly listed sponsor (Route: {route} {('/ ' + sub) if sub else ''})".strip(),
+            "score": 7 if "UK Expansion Worker" in route else 6,
+            "why": f"Newly listed sponsor (Route: {route_display})" + (f" · CH match confidence: {ch_match_conf}" if company_number else " · CH match: not found"),
             "countries": "",
+            "sponsor_route": route_display,
         })
 
-    # Combine + sort
+    # ------------------------------------------------------------
+    # 4) Combine, dedupe, sort, cap
+    # ------------------------------------------------------------
     leads = sponsor_leads + ch_candidates
+
+    # Deduplicate: prefer entries with company_number, then higher score
+    by_key = {}
     for l in leads:
-        l["visa_hint"] = visa_hint(l["source"], int(l.get("score", 0)))
-        l["bucket"] = commercial_bucket(int(l.get("score", 0)))
+        dedupe_key = l.get("company_number") or f"{norm_upper(l.get('company_name',''))}::{norm_upper(l.get('reg_town',''))}::{norm_upper(l.get('sponsor_route',''))}"
+        existing = by_key.get(dedupe_key)
+        if not existing:
+            by_key[dedupe_key] = l
+            continue
+        # prefer having company_number
+        if (not existing.get("company_number")) and l.get("company_number"):
+            by_key[dedupe_key] = l
+            continue
+        # prefer higher score
+        if int(l.get("score",0)) > int(existing.get("score",0)):
+            by_key[dedupe_key] = l
+
+    leads = list(by_key.values())
+
+    # Populate computed fields
+    for l in leads:
+        score_i = int(l.get("score", 0))
+        l["bucket"] = commercial_bucket(score_i)
+        l["visa_hint"] = visa_hint(l["source"], score_i, l.get("sponsor_route",""))
         l.setdefault("website", "")
         l.setdefault("website_confidence", "")
         l.setdefault("emails_found", "")
@@ -693,16 +909,19 @@ def main():
     bucket_rank = {"HOT": 0, "MEDIUM": 1, "WATCH": 2}
     leads.sort(key=lambda x: (bucket_rank.get(x.get("bucket","WATCH"), 9), -int(x.get("score",0)), x.get("source","")))
 
-    # cap for enrichment + email body
+    # Cap to MAX_OUTPUT_LEADS
     leads = leads[:MAX_OUTPUT_LEADS]
-    print(f"[LEADS] Capped to {len(leads)} leads for enrichment/email.", flush=True)
+    print(f"[LEADS] Prepared {len(leads)} leads (capped to {MAX_OUTPUT_LEADS}).", flush=True)
 
-    # Enrich only CH leads (verifiable)
+    # ------------------------------------------------------------
+    # 5) Enrich leads (Sponsor + CH) when we have a CH company number
+    # ------------------------------------------------------------
     serp_budget = {"calls": 0}
     print(f"[ENRICH] Starting SerpAPI enrichment (cap calls={SERP_MAX_CALLS_PER_RUN})…", flush=True)
+
     for i, l in enumerate(leads):
-        if l.get("source") != "COMPANIES_HOUSE":
-            l["enrich_status"] = "Skipped (no Companies House identifier)"
+        if not l.get("company_number"):
+            l["enrich_status"] = "Skipped (no Companies House number)"
             continue
         leads[i] = enrich_lead_with_contact(http, l, serp_key, serp_budget)
 
@@ -712,19 +931,23 @@ def main():
     conn.commit()
     conn.close()
 
-    # CSV attachment
+    # ------------------------------------------------------------
+    # 6) Email + CSV
+    # ------------------------------------------------------------
     df = pd.DataFrame(leads)
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     csv_name = f"uk-expansion-leads_{run_ts.date().isoformat()}.csv"
 
     meta = {
         "run_time_utc": run_ts_iso,
-        "lookback": f"{LOOKBACK_DAYS} days (Companies House) · Sponsor register diff (latest vs seen)",
-        "new_sponsors": len(new_sponsor_rows),
+        "lookback": f"{LOOKBACK_DAYS} days (Companies House) · Sponsor register (routes: Skilled Worker / GBM Senior-Specialist / UK Expansion Worker)",
+        "new_sponsors": len(sponsor_new),
         "new_ch_candidates": len(ch_candidates),
         "serp_calls": serp_budget["calls"],
         "verified_sites": verified_sites,
         "sponsor_error": sponsor_error,
+        "sponsor_baselined": sponsor_baselined,
+        "sponsor_total_filtered": sponsor_total_filtered,
     }
 
     subject = f"UK Expansion Leads — {run_ts.date().isoformat()}"
