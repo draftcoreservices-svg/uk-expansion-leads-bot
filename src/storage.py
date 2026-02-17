@@ -1,14 +1,26 @@
 import hashlib
+from typing import Optional, Any, Dict
 from sqlite_utils import Database
 
 
 class Storage:
+    """
+    SQLite-backed storage for:
+      - deduping seen leads
+      - simple key/value metadata
+      - sponsor register lookup (loaded from GOV.UK CSV)
+
+    Notes on sqlite-utils:
+      - Table.exists() checks whether the TABLE exists, not whether a ROW exists.
+      - Use table.get(pk, default=...) or try/except around table.get(pk) for row existence.
+    """
+
     def __init__(self, path: str = "cache.sqlite"):
         self.db = Database(path)
         self._init()
 
     def _init(self) -> None:
-        # dedupe table
+        # Dedupe table
         self.db["seen"].create(
             {
                 "id": str,
@@ -21,7 +33,7 @@ class Storage:
             if_not_exists=True,
         )
 
-        # metadata key/value store
+        # Metadata key/value store
         self.db["meta"].create(
             {
                 "k": str,
@@ -31,7 +43,7 @@ class Storage:
             if_not_exists=True,
         )
 
-        # sponsor register table (loaded from GOV.UK CSV)
+        # Sponsor register table (loaded from GOV.UK CSV)
         self.db["sponsor_register"].create(
             {
                 "name_norm": str,
@@ -53,8 +65,26 @@ class Storage:
     def lead_id(self, lead_type: str, url: str, title: str) -> str:
         return self._hash(f"{lead_type}|{url}|{title}")
 
+    # -------------------------
+    # Seen-lead dedupe helpers
+    # -------------------------
     def seen_before(self, lead_id: str) -> bool:
-        return self.db["seen"].exists(lead_id)
+        """
+        Returns True if the lead_id row exists in the 'seen' table.
+        Uses pk lookup (not Table.exists()).
+        """
+        tbl = self.db["seen"]
+        try:
+            # sqlite-utils supports default= in recent versions; keep robust fallback.
+            row = tbl.get(lead_id, default=None)
+            return row is not None
+        except TypeError:
+            # If default= isn't supported in some older build, fallback.
+            try:
+                tbl.get(lead_id)
+                return True
+            except Exception:
+                return False
 
     def mark_seen(self, lead_id: str, lead_type: str, title: str, url: str, first_seen: str) -> None:
         self.db["seen"].insert(
@@ -70,26 +100,44 @@ class Storage:
             ignore=True,
         )
 
-    # -------- meta helpers --------
-    def get_meta(self, key: str):
+    # -------------------------
+    # Meta helpers
+    # -------------------------
+    def get_meta(self, key: str) -> Optional[str]:
         tbl = self.db["meta"]
-        if tbl.exists(key):
-            return tbl.get(key)["v"]
-        return None
+        try:
+            row = tbl.get(key, default=None)
+            if row is None:
+                return None
+            return row.get("v")
+        except TypeError:
+            try:
+                return tbl.get(key).get("v")
+            except Exception:
+                return None
 
     def upsert_meta(self, key: str, value: str) -> None:
         self.db["meta"].insert({"k": key, "v": value}, pk="k", replace=True)
 
-    # -------- sponsor register lookup --------
+    # -------------------------
+    # Sponsor register lookup
+    # -------------------------
     @staticmethod
     def normalize_name(name: str) -> str:
-        # Lowercase, keep alnum, collapse whitespace
         cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in (name or ""))
         return " ".join(cleaned.split())
 
-    def sponsor_lookup(self, org_name: str):
+    def sponsor_lookup(self, org_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Returns the sponsor register row dict if present; otherwise None.
+        Uses pk lookup (not Table.exists()).
+        """
         name_norm = self.normalize_name(org_name)
         tbl = self.db["sponsor_register"]
-        if tbl.exists(name_norm):
-            return tbl.get(name_norm)
-        return None
+        try:
+            return tbl.get(name_norm, default=None)
+        except TypeError:
+            try:
+                return tbl.get(name_norm)
+            except Exception:
+                return None
