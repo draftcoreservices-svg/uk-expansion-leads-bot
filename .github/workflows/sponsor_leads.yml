@@ -38,4 +38,5 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           MAX_OUTPUT_LEADS: ${{ secrets.MAX_OUTPUT_LEADS }}
         run: |
+          python -c "import os; k=os.getenv('SERPAPI_API_KEY',''); print('SERPAPI_API_KEY length:', len(k))"
           python -m bot.main
