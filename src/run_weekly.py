@@ -1,19 +1,19 @@
-from .ats_company_lookup import extract_company_website_from_ats
 from datetime import datetime
 from urllib.parse import urlparse
 
-from .config import CFG
-from .storage import Storage
-from .serp import SerpClient
-from .text_extract import fetch_page_text
-from .extract import extract_contacts
-from .leads import Lead
+from .ats_company_lookup import extract_company_website_from_ats
 from .companies_house import CompaniesHouseClient
-from .sponsor_register import refresh_sponsor_register, is_on_sponsor_register
-from .scoring import score_heuristic
-from .openai_classifier import classify_lead, enabled as openai_enabled
+from .config import CFG
 from .email_report import build_email
 from .emailer import send_email
+from .extract import extract_contacts
+from .leads import Lead
+from .openai_classifier import classify_lead, enabled as openai_enabled
+from .scoring import score_heuristic
+from .serp import SerpClient
+from .sponsor_register import refresh_sponsor_register, is_on_sponsor_register
+from .storage import Storage
+from .text_extract import fetch_page_text
 
 
 FREE_EMAIL_DOMAINS = {
@@ -27,10 +27,13 @@ def _denied(url: str) -> bool:
         u = urlparse(url)
         host = (u.netloc or "").lower()
 
-        if any(host.endswith(tld) for tld in CFG.deny_tlds):
+        deny_tlds = getattr(CFG, "deny_tlds", set())
+        deny_domains = getattr(CFG, "deny_domains", set())
+
+        if any(host.endswith(tld) for tld in deny_tlds):
             return True
 
-        for d in CFG.deny_domains:
+        for d in deny_domains:
             if host == d or host.endswith("." + d):
                 return True
 
@@ -40,9 +43,10 @@ def _denied(url: str) -> bool:
 
 
 def _content_excluded(title: str, snippet: str) -> str | None:
+    phrases = getattr(CFG, "content_exclude_phrases", [])
     t = f"{title} {snippet}".lower()
-    for p in CFG.content_exclude_phrases:
-        if p.lower() in t:
+    for p in phrases:
+        if (p or "").lower() in t:
             return p
     return None
 
@@ -71,17 +75,14 @@ def _extract_employer_from_ats(url: str) -> str | None:
         parts = [p for p in (u.path or "").split("/") if p]
 
         if host in {"job-boards.greenhouse.io", "boards.greenhouse.io"}:
-            # /<company>/jobs/<id>
             if len(parts) >= 1:
                 return parts[0]
 
         if host == "jobs.lever.co":
-            # /<company>/<jobId>
             if len(parts) >= 1:
                 return parts[0]
 
         if host == "apply.workable.com":
-            # /<company>/j/<jobId>
             if len(parts) >= 1:
                 return parts[0]
 
@@ -91,7 +92,7 @@ def _extract_employer_from_ats(url: str) -> str | None:
 
 
 def _has_company_signal(lead: Lead) -> bool:
-    # Good if we have a non-free email domain
+    # Non-free email domain is a strong signal
     for e in (lead.contact_emails or []):
         e = (e or "").strip().lower()
         if "@" in e:
@@ -99,12 +100,13 @@ def _has_company_signal(lead: Lead) -> bool:
             if dom and dom not in FREE_EMAIL_DOMAINS:
                 return True
 
-    # Or if the final URL is on a company domain (not ATS host)
+    # Or final URL on a non-ATS, non-deny domain
     try:
         u = urlparse(lead.final_url or lead.url)
         host = (u.netloc or "").lower()
-        if host and host not in CFG.ats_hosts and host not in CFG.deny_domains:
-            # If it's a normal company domain, count it as signal.
+        ats_hosts = getattr(CFG, "ats_hosts", set())
+        deny_domains = getattr(CFG, "deny_domains", set())
+        if host and host not in ats_hosts and host not in deny_domains:
             return True
     except Exception:
         pass
@@ -129,7 +131,6 @@ def _build_leads(serp: SerpClient, lead_type: str, queries: list[str]) -> list[L
             title = r.get("title", "") or ""
             snippet = r.get("snippet", "") or ""
 
-            # Kill obvious job-board listing pages/guides early
             bad_phrase = _content_excluded(title, snippet)
             if bad_phrase:
                 continue
@@ -189,6 +190,7 @@ def main():
 
     for lead in all_raw:
         lead_id = storage.lead_id(lead.lead_type, lead.url, lead.title)
+
         if storage.seen_before(lead_id):
             skipped_seen += 1
             continue
@@ -209,43 +211,40 @@ def main():
             storage.mark_seen(lead_id, lead.lead_type, lead.title, lead.url, now_iso)
             continue
 
-        # Extract contacts
+        # Extract contacts from the fetched page (ATS page etc.)
         emails, phones = extract_contacts(lead.page_text)
         lead.contact_emails = emails
         lead.contact_phones = phones
 
-# Label + ATS homepage enrichment
-employer = _extract_employer_from_ats(lead.final_url or lead.url)
+        # Label + ATS homepage enrichment
+        employer = _extract_employer_from_ats(lead.final_url or lead.url)
 
-if employer:
-    lead.company_or_person = employer
+        if employer:
+            lead.company_or_person = employer
 
-    # Try to extract real company homepage from ATS page
-    company_site = extract_company_website_from_ats(
-        lead.final_url or lead.url,
-        lead.page_text
-    )
+            # Try to extract real company homepage from ATS page
+            company_site = extract_company_website_from_ats(
+                page_url=(lead.final_url or lead.url),
+                page_html_or_text=(lead.page_text or "")
+            )
 
-    if company_site:
-        lead.company_website = company_site
+            if company_site:
+                lead.company_website = company_site
 
-        # Fetch company homepage for better contact discovery
-        try:
-            final_home, home_text = fetch_page_text(company_site, max_chars=CFG.page_text_max_chars)
-            lead.final_url = final_home
-            lead.page_text = home_text
+                # Fetch company homepage for better contact discovery
+                try:
+                    final_home, home_text = fetch_page_text(company_site, max_chars=CFG.page_text_max_chars)
+                    lead.final_url = final_home
+                    lead.page_text = home_text
 
-            # Re-run contact extraction on real homepage
-            emails, phones = extract_contacts(lead.page_text)
-            lead.contact_emails = emails
-            lead.contact_phones = phones
-
-        except Exception:
-            pass
-
-else:
-    lead.company_or_person = _label_from_title(lead.title)
-
+                    # Re-run contact extraction on real homepage
+                    emails, phones = extract_contacts(lead.page_text)
+                    lead.contact_emails = emails
+                    lead.contact_phones = phones
+                except Exception:
+                    pass
+        else:
+            lead.company_or_person = _label_from_title(lead.title)
 
         # Sponsor register check
         if lead.lead_type == "sponsor_licence":
@@ -254,11 +253,10 @@ else:
             except Exception:
                 lead.on_sponsor_register = None
 
-        # Companies House enrichment (only if label looks sane)
+        # Companies House enrichment
         if lead.lead_type in ("sponsor_licence", "global_mobility"):
             try:
-                # Avoid looking up nonsense like "Visa Sponsorship Jobs in London"
-                if len(lead.company_or_person) >= 3:
+                if lead.company_or_person and len(lead.company_or_person) >= 3:
                     lead.companies_house = ch.search_company(lead.company_or_person)
             except Exception:
                 lead.companies_house = None
@@ -296,9 +294,11 @@ else:
         # Mark seen
         storage.mark_seen(lead_id, lead.lead_type, lead.title, lead.url, now_iso)
 
-        # Only allow “strong” leads if we have a real company signal
+        # Strong-lead gating (optional)
+        require_signal = bool(getattr(CFG, "require_company_signal_for_strong", False))
+
         if lead.score >= CFG.strong_threshold:
-            if CFG.require_company_signal_for_strong and lead.lead_type in ("sponsor_licence", "global_mobility"):
+            if require_signal and lead.lead_type in ("sponsor_licence", "global_mobility"):
                 if not _has_company_signal(lead):
                     continue
 
