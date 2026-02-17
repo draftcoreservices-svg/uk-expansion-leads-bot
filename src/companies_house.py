@@ -1,15 +1,40 @@
 import os
+import re
 import requests
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 CH_ENDPOINT = "https://api.company-information.service.gov.uk"
 
 
+def _norm(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return " ".join(s.split()).strip()
+
+
+def _token_set(s: str) -> set:
+    return set(_norm(s).split())
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
 class CompaniesHouseClient:
-    def __init__(self, api_key: Optional[str] = None):
+    """Thin Companies House search client with conservative matching.
+
+    This avoids dangerous 'first result wins' behaviour which produced nonsense matches.
+    """
+
+    def __init__(self, api_key: Optional[str] = None, timeout_s: float = 30.0):
         self.api_key = api_key or os.environ.get("COMPANIES_HOUSE_API_KEY")
         if not self.api_key:
             raise RuntimeError("Missing COMPANIES_HOUSE_API_KEY")
+        self.timeout_s = timeout_s
 
     def search_company(self, name: str) -> Optional[Dict[str, Any]]:
         name = (name or "").strip()
@@ -19,54 +44,38 @@ class CompaniesHouseClient:
         url = f"{CH_ENDPOINT}/search/companies"
         r = requests.get(
             url,
-            params={"q": name, "items_per_page": 5},
+            params={"q": name, "items_per_page": 10},
             auth=(self.api_key, ""),
-            timeout=30,
+            timeout=self.timeout_s,
         )
         r.raise_for_status()
         data = r.json()
+
         items = data.get("items", []) or []
         if not items:
             return None
 
-        def _norm_entity(s: str) -> str:
-            s = "".join(ch.lower() if ch.isalnum() else " " for ch in (s or ""))
-            s = " ".join(s.split())
-            suffixes = {
-                "limited", "ltd", "plc", "llp", "lp", "limited liability partnership",
-                "uk", "holdings", "holding", "group", "international", "int",
-                "services", "service", "company", "co"
-            }
-            toks = [t for t in s.split() if t not in suffixes]
-            return " ".join(toks)
-
-        target = _norm_entity(name)
-        tgt_set = set(target.split())
-
-        best = None
-        best_score = 0.0
+        # Score candidates by token overlap.
+        target = _token_set(name)
+        scored: List[Tuple[float, Dict[str, Any]]] = []
         for it in items:
             title = it.get("title") or ""
-            cand = _norm_entity(title)
-            cand_set = set(cand.split())
-            if not cand_set or not tgt_set:
-                continue
-            inter = len(tgt_set & cand_set)
-            union = len(tgt_set | cand_set)
-            score = inter / union if union else 0.0
-            if score > best_score:
-                best_score = score
-                best = it
+            score = _jaccard(target, _token_set(title))
+            scored.append((score, it))
 
-        # If no decent match, don't guess.
-        if best is None or best_score < 0.80:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, best = scored[0]
+
+        # Conservative threshold: if we aren't sure, return None instead of garbage.
+        if best_score < 0.80:
             return None
 
         return {
-            "company_number": best.get("company_number"),
-            "company_name": best.get("title"),
-            "company_status": best.get("company_status"),
-            "address_snippet": best.get("address_snippet"),
-            "date_of_creation": best.get("date_of_creation"),
-            "match_confidence": round(best_score, 2),
+            "company_name": best.get("title") or "",
+            "company_number": best.get("company_number") or "",
+            "company_status": best.get("company_status") or "",
+            "company_type": best.get("company_type") or "",
+            "address_snippet": (best.get("address_snippet") or "").strip(),
+            "date_of_creation": best.get("date_of_creation") or "",
+            "score": best_score,
         }
