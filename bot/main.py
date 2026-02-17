@@ -248,20 +248,21 @@ if not overseas_flag:
     continue
 
 
-        # store company snapshot
-        db.upsert_company(
-            conn,
-            company_number=company_number,
-            name=company_name,
-            incorporated=incorporated,
-            status=status,
-            sic_codes=sic_codes,
-            reg_address=reg_address,
-            reg_postcode=reg_postcode,
-            reg_town=reg_town,
-            reg_country=reg_country,
-            last_refreshed_utc=run_ts_iso,
-        )
+# store company snapshot
+db.upsert_company(
+    conn,
+    company_number=company_number,
+    name=company_name,
+    incorporated=incorporated,
+    status=status,
+    sic_codes=sic_codes,
+    reg_address=reg_address,
+    reg_postcode=reg_postcode,
+    reg_town=reg_town,
+    reg_country=reg_country,
+    last_refreshed_utc=run_ts_iso,
+)
+
 
         ch_candidates.append({
             'source': 'COMPANIES_HOUSE',
