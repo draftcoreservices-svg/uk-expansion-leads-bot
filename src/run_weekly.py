@@ -15,6 +15,12 @@ from .email_report import build_email
 from .emailer import send_email
 
 
+FREE_EMAIL_DOMAINS = {
+    "gmail.com", "hotmail.com", "outlook.com", "live.com", "yahoo.com", "icloud.com",
+    "proton.me", "protonmail.com", "aol.com", "gmx.com"
+}
+
+
 def _denied(url: str) -> bool:
     try:
         u = urlparse(url)
@@ -32,6 +38,14 @@ def _denied(url: str) -> bool:
         return True
 
 
+def _content_excluded(title: str, snippet: str) -> str | None:
+    t = f"{title} {snippet}".lower()
+    for p in CFG.content_exclude_phrases:
+        if p.lower() in t:
+            return p
+    return None
+
+
 def _label_from_title(title: str) -> str:
     if not title:
         return ""
@@ -40,6 +54,61 @@ def _label_from_title(title: str) -> str:
             title = title.split(sep)[0]
             break
     return title.strip()[:120]
+
+
+def _extract_employer_from_ats(url: str) -> str | None:
+    """
+    Greenhouse/Lever/Workable: derive employer slug from URL.
+    Examples:
+      https://job-boards.greenhouse.io/monzo/jobs/...
+      https://jobs.lever.co/spotify/...
+      https://apply.workable.com/costello-medical/j/...
+    """
+    try:
+        u = urlparse(url)
+        host = (u.netloc or "").lower()
+        parts = [p for p in (u.path or "").split("/") if p]
+
+        if host in {"job-boards.greenhouse.io", "boards.greenhouse.io"}:
+            # /<company>/jobs/<id>
+            if len(parts) >= 1:
+                return parts[0]
+
+        if host == "jobs.lever.co":
+            # /<company>/<jobId>
+            if len(parts) >= 1:
+                return parts[0]
+
+        if host == "apply.workable.com":
+            # /<company>/j/<jobId>
+            if len(parts) >= 1:
+                return parts[0]
+
+        return None
+    except Exception:
+        return None
+
+
+def _has_company_signal(lead: Lead) -> bool:
+    # Good if we have a non-free email domain
+    for e in (lead.contact_emails or []):
+        e = (e or "").strip().lower()
+        if "@" in e:
+            dom = e.split("@", 1)[1]
+            if dom and dom not in FREE_EMAIL_DOMAINS:
+                return True
+
+    # Or if the final URL is on a company domain (not ATS host)
+    try:
+        u = urlparse(lead.final_url or lead.url)
+        host = (u.netloc or "").lower()
+        if host and host not in CFG.ats_hosts and host not in CFG.deny_domains:
+            # If it's a normal company domain, count it as signal.
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 def _build_leads(serp: SerpClient, lead_type: str, queries: list[str]) -> list[Lead]:
@@ -55,16 +124,25 @@ def _build_leads(serp: SerpClient, lead_type: str, queries: list[str]) -> list[L
                 continue
             if _denied(url):
                 continue
+
+            title = r.get("title", "") or ""
+            snippet = r.get("snippet", "") or ""
+
+            # Kill obvious job-board listing pages/guides early
+            bad_phrase = _content_excluded(title, snippet)
+            if bad_phrase:
+                continue
+
             out.append(
                 Lead(
                     lead_type=lead_type,
-                    title=r.get("title", ""),
+                    title=title,
                     url=url,
-                    snippet=r.get("snippet", ""),
+                    snippet=snippet,
                     query=r.get("query", ""),
                 )
             )
-    print(f"[SERP] {lead_type} candidates after deny-filter: {len(out)}")
+    print(f"[SERP] {lead_type} candidates after deny-filter/content-filter: {len(out)}")
     return out
 
 
@@ -126,7 +204,7 @@ def main():
             lead.final_url = final_url
             lead.page_text = text
             pages_fetched += 1
-        except Exception as e:
+        except Exception:
             storage.mark_seen(lead_id, lead.lead_type, lead.title, lead.url, now_iso)
             continue
 
@@ -135,8 +213,12 @@ def main():
         lead.contact_emails = emails
         lead.contact_phones = phones
 
-        # Label
-        lead.company_or_person = _label_from_title(lead.title)
+        # Label: prefer ATS employer extraction if present
+        employer = _extract_employer_from_ats(lead.final_url or lead.url)
+        if employer:
+            lead.company_or_person = employer
+        else:
+            lead.company_or_person = _label_from_title(lead.title)
 
         # Sponsor register check
         if lead.lead_type == "sponsor_licence":
@@ -145,10 +227,12 @@ def main():
             except Exception:
                 lead.on_sponsor_register = None
 
-        # Companies House enrichment
+        # Companies House enrichment (only if label looks sane)
         if lead.lead_type in ("sponsor_licence", "global_mobility"):
             try:
-                lead.companies_house = ch.search_company(lead.company_or_person)
+                # Avoid looking up nonsense like "Visa Sponsorship Jobs in London"
+                if len(lead.company_or_person) >= 3:
+                    lead.companies_house = ch.search_company(lead.company_or_person)
             except Exception:
                 lead.companies_house = None
 
@@ -182,9 +266,15 @@ def main():
                 lead.ai_quote = ai.get("sponsorship_signal_quote", "") or ""
                 openai_calls += 1
 
+        # Mark seen
         storage.mark_seen(lead_id, lead.lead_type, lead.title, lead.url, now_iso)
 
+        # Only allow “strong” leads if we have a real company signal
         if lead.score >= CFG.strong_threshold:
+            if CFG.require_company_signal_for_strong and lead.lead_type in ("sponsor_licence", "global_mobility"):
+                if not _has_company_signal(lead):
+                    continue
+
             if lead.lead_type == "sponsor_licence":
                 sponsor_strong.append(lead)
             elif lead.lead_type == "global_mobility":
@@ -203,7 +293,7 @@ def main():
     print(f"[STATS] processed={processed} skipped_seen={skipped_seen} pages_fetched={pages_fetched} openai_calls={openai_calls}")
     print(f"[LEADS] sponsor_strong={len(sponsor_strong)} mobility_strong={len(mobility_strong)} talent_strong={len(talent_strong)}")
 
-    subject = f"CW Leads — Sponsor/Mobility/Talent — {datetime.utcnow().strftime('%Y-%m-%d')}"
+    subject = f"CW Weekly Leads — {datetime.utcnow().strftime('%Y-%m-%d')}"
     if src_date:
         subject += f" (SponsorReg {src_date})"
 
