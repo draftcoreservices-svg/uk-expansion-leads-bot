@@ -214,12 +214,38 @@ def main():
         lead.contact_emails = emails
         lead.contact_phones = phones
 
-        # Label: prefer ATS employer extraction if present
-        employer = _extract_employer_from_ats(lead.final_url or lead.url)
-        if employer:
-            lead.company_or_person = employer
-        else:
-            lead.company_or_person = _label_from_title(lead.title)
+# Label + ATS homepage enrichment
+employer = _extract_employer_from_ats(lead.final_url or lead.url)
+
+if employer:
+    lead.company_or_person = employer
+
+    # Try to extract real company homepage from ATS page
+    company_site = extract_company_website_from_ats(
+        lead.final_url or lead.url,
+        lead.page_text
+    )
+
+    if company_site:
+        lead.company_website = company_site
+
+        # Fetch company homepage for better contact discovery
+        try:
+            final_home, home_text = fetch_page_text(company_site, max_chars=CFG.page_text_max_chars)
+            lead.final_url = final_home
+            lead.page_text = home_text
+
+            # Re-run contact extraction on real homepage
+            emails, phones = extract_contacts(lead.page_text)
+            lead.contact_emails = emails
+            lead.contact_phones = phones
+
+        except Exception:
+            pass
+
+else:
+    lead.company_or_person = _label_from_title(lead.title)
+
 
         # Sponsor register check
         if lead.lead_type == "sponsor_licence":
