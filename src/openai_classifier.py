@@ -1,10 +1,17 @@
-import os, json
+import os
+import json
 from typing import Optional, Dict, Any
+
 from openai import OpenAI
 
 
 def enabled() -> bool:
     return bool(os.environ.get("OPENAI_API_KEY"))
+
+
+def _model_default() -> str:
+    # Keep configurable to avoid CI failures due to unavailable models.
+    return os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
 
 
 def classify_lead(
@@ -14,73 +21,59 @@ def classify_lead(
     title: str,
     snippet: str,
     page_text: str,
-    model: str = "gpt-5",
+    model: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         return None
 
-    client = OpenAI(api_key=api_key)
-    excerpt = (page_text or "")[:4500]
+    # Ensure we don't hang indefinitely.
+    client = OpenAI(api_key=api_key, timeout=30.0)
 
-    instructions = (
-        "You are a UK business-immigration lead triage assistant for a law firm. "
-        "Classify whether the page indicates a strong potential case for: "
-        "(1) Sponsor Licence needed, (2) Global Mobility (UK expansion / senior or specialist worker / expansion worker), "
-        "(3) Global Talent / Exceptional Promise. "
-        "Return ONLY valid JSON (no markdown)."
+    excerpt = (page_text or "")[:5000]
+
+    system = (
+        "You are a strict business-immigration lead triage assistant for a UK law firm. "
+        "Your job is to detect REAL COMPANY leads and reject noise (blogs, aggregators, generic visa content). "
+        "Be conservative: if unsure, mark as not actionable. Output valid JSON only."
     )
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "bucket": {"type": "string", "enum": ["sponsor_licence", "global_mobility", "global_talent", "none"]},
-            "score": {"type": "integer", "minimum": 0, "maximum": 100},
-            "summary": {"type": "string"},
-            "reasons": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 6},
-            "outreach_angle": {"type": "string"},
-            "sponsorship_signal_quote": {"type": "string"},
+    user = {
+        "lead_type_hint": lead_type_hint,
+        "label": label,
+        "url": url,
+        "title": title,
+        "snippet": snippet,
+        "page_excerpt": excerpt,
+        "task": "Classify this as actionable or not, and explain briefly why.",
+        "rules": [
+            "Reject immigration advice articles, generic guides, government pages.",
+            "Reject job aggregators/directories (Indeed, Reed, etc.).",
+            "Prefer corporate domains and ATS pages (Greenhouse/Lever/Workable).",
+            "For sponsor-licence leads: hiring in UK + sponsorship language + NOT already sponsor-licensed.",
+            "For global mobility leads: UK entry/office/subsidiary/leadership signals in last 18 months.",
+        ],
+        "return_schema": {
+            "actionable": "boolean",
+            "bucket": "one of: sponsor|mobility|talent|reject",
+            "confidence": "0-100 integer",
+            "reason": "short string",
+            "notes": "short string",
         },
-        "required": ["bucket", "score", "summary", "reasons", "outreach_angle", "sponsorship_signal_quote"],
-        "additionalProperties": False,
     }
 
-    payload = (
-        f"Lead type hint: {lead_type_hint}\n"
-        f"Label: {label}\nTitle: {title}\nURL: {url}\nSnippet: {snippet}\n\n"
-        f"Page excerpt:\n{excerpt}"
-    )
-
-    # Attempt 1: enforce JSON schema
     try:
-        resp = client.responses.create(
-            model=model,
-            instructions=instructions,
-            input=payload,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "lead_triage",
-                    "schema": schema,
-                }
-            },
+        resp = client.chat.completions.create(
+            model=(model or _model_default()),
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user)},
+            ],
+            temperature=0.1,
         )
-        return json.loads(resp.output_text)
+        content = resp.choices[0].message.content or ""
+        data = json.loads(content)
+        return data if isinstance(data, dict) else None
     except Exception:
-        pass
-
-    # Attempt 2: plain JSON fallback
-    try:
-        resp = client.responses.create(
-            model=model,
-            instructions=instructions + " Output JSON only.",
-            input=payload,
-        )
-        txt = (resp.output_text or "").strip()
-        start = txt.find("{")
-        end = txt.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            txt = txt[start : end + 1]
-        return json.loads(txt)
-    except Exception:
+        # If AI fails, do not block the pipeline.
         return None
