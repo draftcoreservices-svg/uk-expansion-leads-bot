@@ -2,6 +2,13 @@ from dataclasses import dataclass, field
 import os
 
 
+# GOV.UK landing page (stable) that links to the current Register file
+SPONSOR_REGISTER_PAGE = os.environ.get(
+    "SPONSOR_REGISTER_PAGE",
+    "https://www.gov.uk/government/publications/register-of-licensed-sponsors-workers",
+)
+
+
 def _split_csv(s: str) -> list[str]:
     if not s:
         return []
@@ -25,7 +32,6 @@ class Config:
         "workpermit.com",
         "ukvisajobs.com",
         "ifmosawork.com",
-        "technation.io",   # keep corporate BD clean; talent bucket can still surface personal pages
         "immigram.io",
     })
 
@@ -58,7 +64,6 @@ class Config:
 
     # Queries (core engine)
     queries: dict[str, list[str]] = field(default_factory=lambda: {
-        # Sponsor licence needed — search hiring intent + sponsorship language on real company/ATS pages
         "sponsor": [
             'site:greenhouse.io ("visa sponsorship" OR "Skilled Worker" OR "Certificate of Sponsorship") ("United Kingdom" OR UK OR London OR Manchester OR Bristol OR Leeds)',
             'site:lever.co ("visa sponsorship" OR "Skilled Worker") ("United Kingdom" OR UK OR London)',
@@ -67,8 +72,6 @@ class Config:
             '"we can sponsor" ("United Kingdom" OR UK OR London) (site:greenhouse.io OR site:lever.co OR site:workable.com)',
             '"Skilled Worker" "visa sponsorship" ("United Kingdom" OR UK OR London) (site:greenhouse.io OR site:lever.co OR site:workable.com)',
         ],
-
-        # Global mobility / UK expansion — corporate announcements in last ~12–18 months
         "mobility": [
             '"opens" (UK OR "United Kingdom" OR London) ("new office" OR "UK office") (press OR newsroom OR announcement)',
             '"launches" ("UK subsidiary" OR "United Kingdom subsidiary" OR "UK entity") (press OR newsroom OR announcement)',
@@ -76,8 +79,6 @@ class Config:
             '"appoints" ("UK Managing Director" OR "Head of UK" OR "UK Country Manager") (press OR newsroom OR announcement)',
             '"entering the UK market" (press OR newsroom OR announcement)',
         ],
-
-        # Global Talent signals — keep light, avoid diluting corporate BD
         "talent": [
             '"Global Talent visa" ("Exceptional Promise" OR "Exceptional Talent") ("my application" OR "I applied" OR "endorsed")',
             '"Tech Nation" "Global Talent" ("endorsed" OR "endorsement") ("blog" OR "experience")',
@@ -86,19 +87,15 @@ class Config:
     })
 
 
-# Allow minimal env overrides without breaking defaults
 def _build_config() -> Config:
     serp_num = int(os.environ.get("SERP_NUM", "10") or "10")
 
-    # Extend deny domains if provided
     deny_domains = set(Config().deny_domains)
     deny_domains |= set(_split_csv(os.environ.get("DENY_DOMAINS", "")))
 
-    # Extend exclude phrases if provided
     phrases = list(Config().content_exclude_phrases)
     phrases.extend(_split_csv(os.environ.get("CONTENT_EXCLUDE_PHRASES", "")))
 
-    # Allow overriding thresholds
     min_score_sponsor = int(os.environ.get("MIN_SCORE_SPONSOR", str(Config().min_score_sponsor)))
     min_score_mobility = int(os.environ.get("MIN_SCORE_MOBILITY", str(Config().min_score_mobility)))
     min_score_talent = int(os.environ.get("MIN_SCORE_TALENT", str(Config().min_score_talent)))
