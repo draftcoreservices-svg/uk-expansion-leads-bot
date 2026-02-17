@@ -1,131 +1,199 @@
-import re
-import hashlib
-from datetime import datetime
-from typing import Tuple, Optional
+from dataclasses import dataclass, field
+from typing import List, Set
+import os
 
-import pandas as pd
-import requests
-from bs4 import BeautifulSoup
-
-from .config import SPONSOR_REGISTER_PAGE
-
-DEFAULT_TIMEOUT = (10, 60)  # connect, read
+# GOV.UK landing page (stable) that links to the current register file
+SPONSOR_REGISTER_PAGE = os.environ.get(
+    "SPONSOR_REGISTER_PAGE",
+    "https://www.gov.uk/government/publications/register-of-licensed-sponsors-workers",
+)
 
 
-def _sha256_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
+@dataclass
+class Config:
+    # --- Run limits ---
+    max_results_per_query: int = int(os.environ.get("MAX_RESULTS_PER_QUERY", "10"))
+    max_strong_per_bucket: int = int(os.environ.get("MAX_STRONG_PER_BUCKET", "25"))
+
+    max_pages_to_fetch: int = int(os.environ.get("MAX_PAGES_TO_FETCH", "120"))
+    max_openai_calls: int = int(os.environ.get("MAX_OPENAI_CALLS", "40"))
+    page_text_max_chars: int = int(os.environ.get("PAGE_TEXT_MAX_CHARS", "12000"))
+
+    # --- Scoring thresholds ---
+    strong_threshold: int = int(os.environ.get("STRONG_THRESHOLD", "70"))
+    medium_threshold: int = int(os.environ.get("MEDIUM_THRESHOLD", "55"))
+
+    # If True: "strong" sponsor/mobility leads must have a real company signal (email/domain)
+    require_company_signal_for_strong: bool = os.environ.get("REQUIRE_COMPANY_SIGNAL_FOR_STRONG", "true").lower() in (
+        "1", "true", "yes"
+    )
+
+    # --- Deny filters ---
+    deny_tlds: Set[str] = field(default_factory=lambda: {
+        ".gov.uk", ".nhs.uk", ".ac.uk"
+    })
+
+    deny_domains: Set[str] = field(default_factory=lambda: {
+        # gov/admin
+        "cqc.org.uk",
+        "companieshouse.gov.uk",
+        "find-and-update.company-information.service.gov.uk",
+
+        # job boards / aggregators
+        "reed.co.uk",
+        "indeed.com",
+        "indeed.co.uk",
+        "glassdoor.com",
+        "glassdoor.co.uk",
+        "totaljobs.com",
+        "cv-library.co.uk",
+        "monster.co.uk",
+        "jobsite.co.uk",
+        "adzuna.co.uk",
+        "ziprecruiter.com",
+        "ziprecruiter.co.uk",
+        "workcircle.com",
+        "jobrapido.com",
+        "careerjet.co.uk",
+        "jooble.org",
+        "neuvoo.com",
+        "jobs.nhs.uk",
+        "findajob.dwp.gov.uk",
+
+        # social / noisy sources for lead gen
+        "linkedin.com",
+        "uk.linkedin.com",
+        "facebook.com",
+        "twitter.com",
+        "x.com",
+        "instagram.com",
+        "tiktok.com",
+
+        # generic directory / list style sites
+        "wikipedia.org",
+
+        # immigration guides / visa-job list sites (noise for corporate BD)
+        "workpermit.com",
+        "ukvisajobs.com",
+        "ifmosawork.com",
+        "immigram.io",
+        "technomads.io",
+        "technation.io",
+    })
+
+    # SERP title/snippet filters (pre-fetch)
+    content_exclude_phrases: List[str] = field(default_factory=lambda: [
+        # list/guide patterns
+        "shortage occupation",
+        "shortage occupation list",
+        "skilled worker shortage",
+        "visa sponsorship jobs",
+        "jobs with visa sponsorship",
+        "uk visa jobs",
+        "certificate of sponsorship explained",
+        "what is a skilled worker visa",
+        "immigration advice",
+        "visa blog",
+        "tier 2 guide",
+        "ukvi guidance",
+        "apply now",
+        "create job alert",
+        "salary guide",
+    ])
+
+    # Phrase signals used by scoring.py (keep consistent with your scoring rules)
+    sponsor_phrases: List[str] = field(default_factory=lambda: [
+        "visa sponsorship",
+        "sponsorship available",
+        "skilled worker",
+        "we can sponsor",
+        "tier 2",
+        "certificate of sponsorship",
+        "cos available",
+        "sponsor licence",
+        "sponsor license",
+        "right to work sponsorship",
+    ])
+
+    uk_location_phrases: List[str] = field(default_factory=lambda: [
+        "united kingdom",
+        " uk ",
+        "london",
+        "manchester",
+        "birmingham",
+        "edinburgh",
+        "bristol",
+        "leeds",
+        "glasgow",
+        "remote uk",
+        "hybrid uk",
+    ])
+
+    expansion_phrases: List[str] = field(default_factory=lambda: [
+        "opening a london office",
+        "opening our london office",
+        "opening a uk office",
+        "expanding into the uk",
+        "launches in the uk",
+        "uk launch",
+        "establishing a uk entity",
+        "entering the uk market",
+        "opening in london",
+        "opening in the uk",
+        "opening a london hub",
+        "setting up a uk subsidiary",
+        "establishing a uk subsidiary",
+        "uk subsidiary",
+    ])
+
+    global_talent_phrases: List[str] = field(default_factory=lambda: [
+        "global talent visa",
+        "exceptional promise",
+        "exceptional talent",
+        "endorsement",
+        "endorsed",
+        "tech nation",
+        "arts council",
+        "royal society",
+        "ukri",
+        "british academy",
+        "research fellowship",
+    ])
+
+    # --- Search queries ---
+    sponsor_queries: List[str] = field(default_factory=lambda: [
+        'site:job-boards.greenhouse.io ("United Kingdom" OR London) ("visa sponsorship" OR "Skilled Worker" OR "certificate of sponsorship" OR sponsor)',
+        'site:jobs.lever.co ("London" OR "United Kingdom") ("visa sponsorship" OR "Skilled Worker" OR sponsor)',
+        'site:apply.workable.com ("United Kingdom" OR London) ("visa sponsorship" OR "Skilled Worker" OR sponsor)',
+        '"visa sponsorship" (careers OR jobs) (London OR "United Kingdom") -site:reed.co.uk -site:indeed.co.uk -site:indeed.com -site:linkedin.com',
+        '"Skilled Worker" (careers OR jobs) (London OR "United Kingdom") -site:reed.co.uk -site:indeed.co.uk -site:indeed.com -site:linkedin.com',
+        '"certificate of sponsorship" (careers OR jobs) (London OR "United Kingdom") -site:reed.co.uk -site:indeed.co.uk -site:indeed.com -site:linkedin.com',
+    ])
+
+    mobility_queries: List[str] = field(default_factory=lambda: [
+        '"opens" "London office" (press OR newsroom OR announcement)',
+        '"opening" "London office" (press OR newsroom OR announcement)',
+        '"launches" "UK office" (press OR newsroom OR announcement)',
+        '"establishes" "UK subsidiary" (press OR announcement OR newsroom)',
+        '"first UK office" (press OR newsroom OR announcement)',
+        '"appointed" ("UK Country Manager" OR "Head of UK" OR "UK Managing Director") (London OR UK)',
+    ])
+
+    talent_queries: List[str] = field(default_factory=lambda: [
+        '"Global Talent visa" "my application"',
+        '"Exceptional Promise" "Global Talent" "I got endorsed"',
+        '"Tech Nation" "Global Talent" "endorsement" "my case"',
+        '"Global Talent" "moving to London"',
+        '"Global Talent visa" "endorsed" "Tech Nation"',
+    ])
+
+    # ATS hosts we allow (used by run_weekly.py for signal logic)
+    ats_hosts: Set[str] = field(default_factory=lambda: {
+        "job-boards.greenhouse.io",
+        "boards.greenhouse.io",
+        "jobs.lever.co",
+        "apply.workable.com",
+    })
 
 
-def _extract_register_file_url_from_govuk(page_url: str) -> Optional[str]:
-    """
-    GOV.UK publication pages usually contain a direct link to an attachment (xlsx/csv/ods).
-    We pick the first .xlsx if present, otherwise first csv/ods.
-    """
-    r = requests.get(page_url, timeout=DEFAULT_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (CWLeadsBot/1.0)"})
-    r.raise_for_status()
-
-    soup = BeautifulSoup(r.text, "lxml")
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if not href:
-            continue
-        if href.startswith("/"):
-            href = "https://www.gov.uk" + href
-        links.append(href)
-
-    # Prefer XLSX, then CSV, then ODS
-    for ext in (".xlsx", ".csv", ".ods"):
-        for href in links:
-            if href.lower().split("?")[0].endswith(ext):
-                return href
-
-    return None
-
-
-def _download_register_bytes() -> Tuple[bytes, str]:
-    file_url = _extract_register_file_url_from_govuk(SPONSOR_REGISTER_PAGE)
-    if not file_url:
-        raise RuntimeError(f"Could not find sponsor register attachment link on: {SPONSOR_REGISTER_PAGE}")
-
-    r = requests.get(file_url, timeout=DEFAULT_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (CWLeadsBot/1.0)"})
-    r.raise_for_status()
-    return r.content, file_url
-
-
-def _load_register_df(content: bytes, file_url: str) -> pd.DataFrame:
-    lower = file_url.lower().split("?")[0]
-    if lower.endswith(".csv"):
-        df = pd.read_csv(pd.io.common.BytesIO(content))
-    else:
-        # xlsx/ods
-        df = pd.read_excel(pd.io.common.BytesIO(content))
-
-    # Normalize column names
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    return df
-
-
-def _normalize_name(name: str) -> str:
-    s = (name or "").lower()
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    return " ".join(s.split()).strip()
-
-
-def refresh_sponsor_register(storage) -> Tuple[bool, str]:
-    """
-    Downloads sponsor register and stores names in sqlite via Storage.
-    Returns (updated, src_date_str).
-    """
-    content, file_url = _download_register_bytes()
-    digest = _sha256_bytes(content)
-
-    # If unchanged, skip
-    existing = storage.get_meta("sponsor_register_sha256")
-    if existing and existing == digest:
-        # Still return a "date" for subject line – use today if unchanged
-        return False, datetime.utcnow().strftime("%Y-%m-%d")
-
-    df = _load_register_df(content, file_url)
-
-    # Heuristic: find best column containing organisation name
-    # Typical columns include: "organisation name", "name", "sponsor name"
-    name_col = None
-    for c in df.columns:
-        if c in ("organisation name", "organization name", "name", "sponsor name"):
-            name_col = c
-            break
-    if not name_col:
-        # fallback: first column containing "name"
-        for c in df.columns:
-            if "name" in c:
-                name_col = c
-                break
-    if not name_col:
-        raise RuntimeError(f"Could not identify sponsor name column in register file. Columns: {df.columns.tolist()}")
-
-    names = []
-    for raw in df[name_col].astype(str).tolist():
-        n = _normalize_name(raw)
-        if n:
-            names.append(n)
-
-    names = sorted(set(names))
-
-    storage.replace_sponsor_register(names)
-    storage.set_meta("sponsor_register_sha256", digest)
-    storage.set_meta("sponsor_register_source_url", file_url)
-
-    # Best-effort source date: use today (publication attachment dates can be inconsistent)
-    src_date = datetime.utcnow().strftime("%Y-%m-%d")
-    return True, src_date
-
-
-def is_on_sponsor_register(storage, company_name: str) -> bool:
-    """
-    Exact match against normalized sponsor names stored in sqlite.
-    (Fuzzy matching happens higher up / elsewhere.)
-    """
-    if not company_name:
-        return False
-    return storage.is_on_sponsor_register(_normalize_name(company_name))
+CFG = Config()
