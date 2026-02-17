@@ -16,6 +16,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Restore bot cache (state)
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: uk-expansion-leads-bot-cache-v1
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
