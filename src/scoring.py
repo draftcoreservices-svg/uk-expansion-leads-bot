@@ -54,8 +54,12 @@ def score_heuristic(lead: Lead) -> Lead:
         lead.reasons = [f"Excluded keyword match: {bad_kw}"]
         return lead
 
+    # ------------------------------------------------
+    # SPONSOR LICENCE LEADS
+    # ------------------------------------------------
     if lead.lead_type == "sponsor_licence":
         s = 0
+
         hits = _contains_any(tlow, CFG.sponsor_phrases)
         if hits:
             s += 40
@@ -86,8 +90,12 @@ def score_heuristic(lead: Lead) -> Lead:
 
         lead.score = s
 
+    # ------------------------------------------------
+    # GLOBAL MOBILITY LEADS
+    # ------------------------------------------------
     elif lead.lead_type == "global_mobility":
         s = 0
+
         exp_hits = _contains_any(tlow, CFG.expansion_phrases)
         if exp_hits:
             s += 40
@@ -98,8 +106,11 @@ def score_heuristic(lead: Lead) -> Lead:
             s += 15
             lead.reasons.append("International/group language present")
 
+        # Defensive: only use overseas_hq_phrases if defined in Config
+        overseas_phrases = getattr(CFG, "overseas_hq_phrases", [])
         hq_countries = ["usa", "india", "uae", "germany", "france", "singapore", "australia", "canada", "netherlands"]
-        if any(p in tlow for p in CFG.overseas_hq_phrases) and any(c in tlow for c in hq_countries):
+
+        if overseas_phrases and any(p in tlow for p in overseas_phrases) and any(c in tlow for c in hq_countries):
             s += 20
             lead.reasons.append("Overseas HQ suggested by text")
 
@@ -111,8 +122,12 @@ def score_heuristic(lead: Lead) -> Lead:
 
         lead.score = s
 
+    # ------------------------------------------------
+    # GLOBAL TALENT LEADS
+    # ------------------------------------------------
     else:  # global_talent
         s = 0
+
         gt_hits = _contains_any(tlow, CFG.global_talent_phrases)
         if gt_hits:
             s += 45
