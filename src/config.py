@@ -1,45 +1,89 @@
 from dataclasses import dataclass, field
+from typing import List, Set
 import os
 
-
-# GOV.UK landing page (stable) that links to the current Register file
+# GOV.UK landing page (stable) that links to the current register file
 SPONSOR_REGISTER_PAGE = os.environ.get(
     "SPONSOR_REGISTER_PAGE",
     "https://www.gov.uk/government/publications/register-of-licensed-sponsors-workers",
 )
 
 
-def _split_csv(s: str) -> list[str]:
-    if not s:
-        return []
-    return [x.strip() for x in s.split(",") if x.strip()]
-
-
-@dataclass(frozen=True)
+@dataclass
 class Config:
-    # Serp behaviour
-    serp_num: int = 10
+    # --- Run limits ---
+    max_results_per_query: int = int(os.environ.get("MAX_RESULTS_PER_QUERY", "10"))
+    max_strong_per_bucket: int = int(os.environ.get("MAX_STRONG_PER_BUCKET", "25"))
 
-    # Domain hard-deny (prevents obvious noise)
-    deny_domains: set[str] = field(default_factory=lambda: {
-        "indeed.com",
+    max_pages_to_fetch: int = int(os.environ.get("MAX_PAGES_TO_FETCH", "120"))
+    max_openai_calls: int = int(os.environ.get("MAX_OPENAI_CALLS", "40"))
+    page_text_max_chars: int = int(os.environ.get("PAGE_TEXT_MAX_CHARS", "12000"))
+
+    # --- Scoring thresholds ---
+    strong_threshold: int = int(os.environ.get("STRONG_THRESHOLD", "70"))
+    medium_threshold: int = int(os.environ.get("MEDIUM_THRESHOLD", "55"))
+
+    # If True: "strong" sponsor/mobility leads must have a real company signal (email/domain)
+    require_company_signal_for_strong: bool = os.environ.get("REQUIRE_COMPANY_SIGNAL_FOR_STRONG", "true").lower() in (
+        "1", "true", "yes"
+    )
+
+    # --- Deny filters ---
+    deny_tlds: Set[str] = field(default_factory=lambda: {
+        ".gov.uk", ".nhs.uk", ".ac.uk"
+    })
+
+    deny_domains: Set[str] = field(default_factory=lambda: {
+        # gov/admin
+        "cqc.org.uk",
+        "companieshouse.gov.uk",
+        "find-and-update.company-information.service.gov.uk",
+
+        # job boards / aggregators
         "reed.co.uk",
-        "totaljobs.com",
-        "glassdoor.co.uk",
+        "indeed.com",
+        "indeed.co.uk",
         "glassdoor.com",
+        "glassdoor.co.uk",
+        "totaljobs.com",
+        "cv-library.co.uk",
+        "monster.co.uk",
+        "jobsite.co.uk",
+        "adzuna.co.uk",
+        "ziprecruiter.com",
+        "ziprecruiter.co.uk",
+        "workcircle.com",
+        "jobrapido.com",
+        "careerjet.co.uk",
+        "jooble.org",
+        "neuvoo.com",
+        "jobs.nhs.uk",
+        "findajob.dwp.gov.uk",
+
+        # social / noisy sources for lead gen
         "linkedin.com",
-        "gov.uk",
+        "uk.linkedin.com",
+        "facebook.com",
+        "twitter.com",
+        "x.com",
+        "instagram.com",
+        "tiktok.com",
+
+        # generic directory / list style sites
+        "wikipedia.org",
+
+        # immigration guides / visa-job list sites (noise for corporate BD)
         "workpermit.com",
         "ukvisajobs.com",
         "ifmosawork.com",
         "immigram.io",
+        "technomads.io",
+        "technation.io",
     })
 
-    # TLD deny (rarely needed; keep empty by default)
-    deny_tlds: set[str] = field(default_factory=set)
-
-    # Phrase-based exclusion (applied to SERP title+snippet BEFORE fetching)
-    content_exclude_phrases: list[str] = field(default_factory=lambda: [
+    # SERP title/snippet filters (pre-fetch)
+    content_exclude_phrases: List[str] = field(default_factory=lambda: [
+        # list/guide patterns
         "shortage occupation",
         "shortage occupation list",
         "skilled worker shortage",
@@ -47,69 +91,109 @@ class Config:
         "jobs with visa sponsorship",
         "uk visa jobs",
         "certificate of sponsorship explained",
-        "how to apply",
-        "guidance",
         "what is a skilled worker visa",
         "immigration advice",
-        "immigration opportunities",
         "visa blog",
         "tier 2 guide",
         "ukvi guidance",
+        "apply now",
+        "create job alert",
+        "salary guide",
     ])
 
-    # Score thresholds
-    min_score_sponsor: int = 70
-    min_score_mobility: int = 70
-    min_score_talent: int = 75
+    # Phrase signals used by scoring.py (keep consistent with your scoring rules)
+    sponsor_phrases: List[str] = field(default_factory=lambda: [
+        "visa sponsorship",
+        "sponsorship available",
+        "skilled worker",
+        "we can sponsor",
+        "tier 2",
+        "certificate of sponsorship",
+        "cos available",
+        "sponsor licence",
+        "sponsor license",
+        "right to work sponsorship",
+    ])
 
-    # Queries (core engine)
-    queries: dict[str, list[str]] = field(default_factory=lambda: {
-        "sponsor": [
-            'site:greenhouse.io ("visa sponsorship" OR "Skilled Worker" OR "Certificate of Sponsorship") ("United Kingdom" OR UK OR London OR Manchester OR Bristol OR Leeds)',
-            'site:lever.co ("visa sponsorship" OR "Skilled Worker") ("United Kingdom" OR UK OR London)',
-            'site:workable.com ("visa sponsorship" OR "Skilled Worker") ("United Kingdom" OR UK OR London)',
-            '"visa sponsorship" ("United Kingdom" OR UK OR London) (site:greenhouse.io OR site:lever.co OR site:workable.com)',
-            '"we can sponsor" ("United Kingdom" OR UK OR London) (site:greenhouse.io OR site:lever.co OR site:workable.com)',
-            '"Skilled Worker" "visa sponsorship" ("United Kingdom" OR UK OR London) (site:greenhouse.io OR site:lever.co OR site:workable.com)',
-        ],
-        "mobility": [
-            '"opens" (UK OR "United Kingdom" OR London) ("new office" OR "UK office") (press OR newsroom OR announcement)',
-            '"launches" ("UK subsidiary" OR "United Kingdom subsidiary" OR "UK entity") (press OR newsroom OR announcement)',
-            '"establishes" ("UK subsidiary" OR "UK office" OR "London office") (press OR newsroom OR announcement)',
-            '"appoints" ("UK Managing Director" OR "Head of UK" OR "UK Country Manager") (press OR newsroom OR announcement)',
-            '"entering the UK market" (press OR newsroom OR announcement)',
-        ],
-        "talent": [
-            '"Global Talent visa" ("Exceptional Promise" OR "Exceptional Talent") ("my application" OR "I applied" OR "endorsed")',
-            '"Tech Nation" "Global Talent" ("endorsed" OR "endorsement") ("blog" OR "experience")',
-            '"Global Talent visa" "endorsement" ("timeline" OR "guide") ("Exceptional Promise" OR "Exceptional Talent")',
-        ],
+    uk_location_phrases: List[str] = field(default_factory=lambda: [
+        "united kingdom",
+        " uk ",
+        "london",
+        "manchester",
+        "birmingham",
+        "edinburgh",
+        "bristol",
+        "leeds",
+        "glasgow",
+        "remote uk",
+        "hybrid uk",
+    ])
+
+    expansion_phrases: List[str] = field(default_factory=lambda: [
+        "opening a london office",
+        "opening our london office",
+        "opening a uk office",
+        "expanding into the uk",
+        "launches in the uk",
+        "uk launch",
+        "establishing a uk entity",
+        "entering the uk market",
+        "opening in london",
+        "opening in the uk",
+        "opening a london hub",
+        "setting up a uk subsidiary",
+        "establishing a uk subsidiary",
+        "uk subsidiary",
+    ])
+
+    global_talent_phrases: List[str] = field(default_factory=lambda: [
+        "global talent visa",
+        "exceptional promise",
+        "exceptional talent",
+        "endorsement",
+        "endorsed",
+        "tech nation",
+        "arts council",
+        "royal society",
+        "ukri",
+        "british academy",
+        "research fellowship",
+    ])
+
+    # --- Search queries ---
+    sponsor_queries: List[str] = field(default_factory=lambda: [
+        'site:job-boards.greenhouse.io ("United Kingdom" OR London) ("visa sponsorship" OR "Skilled Worker" OR "certificate of sponsorship" OR sponsor)',
+        'site:jobs.lever.co ("London" OR "United Kingdom") ("visa sponsorship" OR "Skilled Worker" OR sponsor)',
+        'site:apply.workable.com ("United Kingdom" OR London) ("visa sponsorship" OR "Skilled Worker" OR sponsor)',
+        '"visa sponsorship" (careers OR jobs) (London OR "United Kingdom") -site:reed.co.uk -site:indeed.co.uk -site:indeed.com -site:linkedin.com',
+        '"Skilled Worker" (careers OR jobs) (London OR "United Kingdom") -site:reed.co.uk -site:indeed.co.uk -site:indeed.com -site:linkedin.com',
+        '"certificate of sponsorship" (careers OR jobs) (London OR "United Kingdom") -site:reed.co.uk -site:indeed.co.uk -site:indeed.com -site:linkedin.com',
+    ])
+
+    mobility_queries: List[str] = field(default_factory=lambda: [
+        '"opens" "London office" (press OR newsroom OR announcement)',
+        '"opening" "London office" (press OR newsroom OR announcement)',
+        '"launches" "UK office" (press OR newsroom OR announcement)',
+        '"establishes" "UK subsidiary" (press OR announcement OR newsroom)',
+        '"first UK office" (press OR newsroom OR announcement)',
+        '"appointed" ("UK Country Manager" OR "Head of UK" OR "UK Managing Director") (London OR UK)',
+    ])
+
+    talent_queries: List[str] = field(default_factory=lambda: [
+        '"Global Talent visa" "my application"',
+        '"Exceptional Promise" "Global Talent" "I got endorsed"',
+        '"Tech Nation" "Global Talent" "endorsement" "my case"',
+        '"Global Talent" "moving to London"',
+        '"Global Talent visa" "endorsed" "Tech Nation"',
+    ])
+
+    # ATS hosts we allow (used by run_weekly.py for signal logic)
+    ats_hosts: Set[str] = field(default_factory=lambda: {
+        "job-boards.greenhouse.io",
+        "boards.greenhouse.io",
+        "jobs.lever.co",
+        "apply.workable.com",
     })
 
 
-def _build_config() -> Config:
-    serp_num = int(os.environ.get("SERP_NUM", "10") or "10")
-
-    deny_domains = set(Config().deny_domains)
-    deny_domains |= set(_split_csv(os.environ.get("DENY_DOMAINS", "")))
-
-    phrases = list(Config().content_exclude_phrases)
-    phrases.extend(_split_csv(os.environ.get("CONTENT_EXCLUDE_PHRASES", "")))
-
-    min_score_sponsor = int(os.environ.get("MIN_SCORE_SPONSOR", str(Config().min_score_sponsor)))
-    min_score_mobility = int(os.environ.get("MIN_SCORE_MOBILITY", str(Config().min_score_mobility)))
-    min_score_talent = int(os.environ.get("MIN_SCORE_TALENT", str(Config().min_score_talent)))
-
-    return Config(
-        serp_num=serp_num,
-        deny_domains=deny_domains,
-        deny_tlds=set(Config().deny_tlds),
-        content_exclude_phrases=phrases,
-        min_score_sponsor=min_score_sponsor,
-        min_score_mobility=min_score_mobility,
-        min_score_talent=min_score_talent,
-        queries=Config().queries,
-    )
-
-
-CFG = _build_config()
+CFG = Config()
