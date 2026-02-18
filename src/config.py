@@ -72,6 +72,22 @@ class Config:
         # generic directory / list style sites
         "wikipedia.org",
 
+        # PR / syndication wires (high noise for "UK expansion" leads)
+        "prnewswire.com",
+        "www.prnewswire.com",
+        "businesswire.com",
+        "www.businesswire.com",
+        "globenewswire.com",
+        "www.globenewswire.com",
+        "newswire.ca",
+        "www.newswire.ca",
+        "einpresswire.com",
+        "www.einpresswire.com",
+        "accesswire.com",
+        "www.accesswire.com",
+        "marketwatch.com",
+        "www.marketwatch.com",
+
         # immigration guides / visa-job list sites (noise for corporate BD)
         "workpermit.com",
         "ukvisajobs.com",
@@ -102,7 +118,6 @@ class Config:
     ])
 
     # Hard exclude based on *name/title* (used by scoring.py hard_excluded())
-    # This is the missing attribute causing your crash.
     name_exclude_keywords: List[str] = field(default_factory=lambda: [
         # generic list/guide noise
         "shortage occupation",
