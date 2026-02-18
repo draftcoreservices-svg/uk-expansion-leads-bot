@@ -1,4 +1,5 @@
 from datetime import datetime
+import re
 from urllib.parse import urlparse
 
 from .ats_company_lookup import extract_company_website_from_ats, extract_company_name_from_ats
@@ -56,6 +57,48 @@ def _label_from_title(title: str) -> str:
             title = title.split(sep)[0]
             break
     return title.strip()[:120]
+
+
+def _company_from_job_title(title: str) -> str | None:
+    """Best-effort: extract employer from job-style titles.
+
+    Examples:
+      "Job Application for Staff Technical Program Manager, Platform at Monzo" -> "Monzo"
+      "Senior Engineer (Visa sponsorship) at Acme Ltd | Careers" -> "Acme Ltd"
+    """
+    t = (title or "").strip()
+    if not t:
+        return None
+    t = _label_from_title(t)
+
+    m = re.search(r"\bat\s+([^|—–\-·]+)$", t, flags=re.IGNORECASE)
+    if m:
+        c = m.group(1).strip()
+        if len(c) >= 2:
+            return c[:120]
+    return None
+
+
+def _company_from_mobility_title(title: str) -> str | None:
+    """Best-effort: extract company from expansion headline titles."""
+    t = (title or "").strip()
+    if not t:
+        return None
+    t = _label_from_title(t)
+
+    # Common verbs in expansion announcements
+    verbs = [
+        "opens", "opening", "launches", "launching", "establishes", "establishing",
+        "sets up", "setting up", "expands", "expanding", "strengthens", "appoints", "appointed",
+    ]
+    tl = t.lower()
+    for v in verbs:
+        idx = tl.find(v)
+        if idx > 2:
+            c = t[:idx].strip()
+            if len(c) >= 2:
+                return c[:120]
+    return None
 
 
 def _extract_employer_from_ats(url: str) -> str | None:
@@ -256,14 +299,13 @@ def main():
                 except Exception:
                     pass
         else:
-            lead.company_or_person = _label_from_title(lead.title)
-
-        # Sponsor register check
-        if lead.lead_type == "sponsor_licence":
-            try:
-                lead.on_sponsor_register = is_on_sponsor_register(storage, lead.company_or_person)
-            except Exception:
-                lead.on_sponsor_register = None
+            # Non-ATS pages: try to extract a usable company label.
+            if lead.lead_type == "sponsor_licence":
+                lead.company_or_person = _company_from_job_title(lead.title) or _label_from_title(lead.title)
+            elif lead.lead_type == "global_mobility":
+                lead.company_or_person = _company_from_mobility_title(lead.title) or _label_from_title(lead.title)
+            else:
+                lead.company_or_person = _label_from_title(lead.title)
 
         # Companies House enrichment
         if lead.lead_type in ("sponsor_licence", "global_mobility"):
@@ -272,6 +314,17 @@ def main():
                     lead.companies_house = ch.search_company(lead.company_or_person)
             except Exception:
                 lead.companies_house = None
+
+        # Sponsor register check (use Companies House legal name if available)
+        if lead.lead_type == "sponsor_licence":
+            try:
+                sr_name = None
+                if lead.companies_house and lead.companies_house.get("company_name"):
+                    sr_name = lead.companies_house.get("company_name")
+                sr_name = sr_name or lead.company_or_person
+                lead.on_sponsor_register = is_on_sponsor_register(storage, sr_name)
+            except Exception:
+                lead.on_sponsor_register = None
 
         # Heuristic scoring
         lead = score_heuristic(lead)
@@ -314,6 +367,15 @@ def main():
         require_signal = bool(getattr(CFG, "require_company_signal_for_strong", False))
 
         if lead.score >= CFG.strong_threshold:
+            # Hard recency gate for expansion leads: if the page mentions only old years, drop it.
+            if lead.lead_type == "global_mobility":
+                years = [int(y) for y in re.findall(r"\b(19\d{2}|20\d{2})\b", (lead.page_text or "").lower())]
+                if years:
+                    newest = max(years)
+                    current_year = datetime.utcnow().year
+                    if newest <= current_year - 2:
+                        continue
+
             if require_signal and lead.lead_type in ("sponsor_licence", "global_mobility"):
                 if not _has_company_signal(lead):
                     continue
