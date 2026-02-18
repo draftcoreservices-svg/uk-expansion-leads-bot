@@ -1,46 +1,42 @@
-name: cw-weekly-leads
+name: CW Weekly Leads
 
 on:
   schedule:
-    - cron: "0 8 * * 1"   # Monday 08:00 UTC
-  workflow_dispatch:
+    - cron: "0 8 * * 1"   # Monday 08:00 Europe/London-ish (GitHub cron is UTC; see note below)
+  workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Setup Python
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Cache sqlite
+        uses: actions/cache@v4
+        with:
+          path: cw_cache.sqlite
+          key: cw-cache-v1
+          restore-keys: cw-cache-
+
+      - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run weekly bot
+      - name: Run bot
         env:
-          PYTHONUNBUFFERED: "1"
-
-          # Enrichment / scoring
           COMPANIES_HOUSE_API_KEY: ${{ secrets.COMPANIES_HOUSE_API_KEY }}
-
-          # SerpAPI (support multiple secret/env names)
-          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
-          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
-          SERP_API_KEY: ${{ secrets.SERP_API_KEY }}
-
-          # OpenAI (optional triage layer)
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-
-          # Email
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          # kept for compatibility; not used in this build
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
         run: python -u -m src.run_weekly
