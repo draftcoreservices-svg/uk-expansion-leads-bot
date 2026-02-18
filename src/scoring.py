@@ -38,7 +38,8 @@ def _count_roles_heuristic(text: str) -> int:
 def hard_excluded(name_or_title: str) -> str | None:
     upper = (name_or_title or "").upper()
     for kw in CFG.name_exclude_keywords:
-        if kw in upper:
+        # Compare case-insensitively (previous version silently failed)
+        if (kw or "").upper() in upper:
             return kw
     return None
 
@@ -90,8 +91,10 @@ def score_heuristic(lead: Lead) -> Lead:
             s += 15
             lead.reasons.append("Not on sponsor register")
         elif lead.on_sponsor_register is True:
-            s -= 40
-            lead.reasons.append("Already on sponsor register (likely not a sponsor-setup lead)")
+            # This bucket is specifically "needs sponsor licence".
+            # If they're already licensed, treat as not a sponsor-setup lead.
+            s = 0
+            lead.reasons = ["Already on sponsor register (not a sponsor-setup lead)"]
 
         lead.score = s
 
@@ -111,7 +114,6 @@ def score_heuristic(lead: Lead) -> Lead:
             s += 15
             lead.reasons.append("International/group language present")
 
-        # Defensive: only use overseas_hq_phrases if defined in Config
         overseas_phrases = getattr(CFG, "overseas_hq_phrases", [])
         hq_countries = ["usa", "india", "uae", "germany", "france", "singapore", "australia", "canada", "netherlands"]
 
@@ -126,7 +128,6 @@ def score_heuristic(lead: Lead) -> Lead:
             lead.reasons.append("Hiring signal + UK location present")
 
         # Recency safeguard: heavily penalise old announcements.
-        # (We only need coarse detection: if the page loudly shows a year that is far in the past.)
         years = [int(y) for y in re.findall(r"\b(19\d{2}|20\d{2})\b", tlow)]
         if years:
             newest = max(years)
