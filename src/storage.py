@@ -75,11 +75,9 @@ class Storage:
         """
         tbl = self.db["seen"]
         try:
-            # sqlite-utils supports default= in recent versions; keep robust fallback.
             row = tbl.get(lead_id, default=None)
             return row is not None
         except TypeError:
-            # If default= isn't supported in some older build, fallback.
             try:
                 tbl.get(lead_id)
                 return True
@@ -136,7 +134,13 @@ class Storage:
         suffixes = {
             "limited", "ltd", "plc", "llp", "lp", "limited liability partnership",
             "uk", "holdings", "holding", "group", "international", "int", "services",
-            "service", "company", "co"
+            "service", "company", "co",
+
+            # Common junk tokens seen when labels accidentally become job titles/headlines
+            "job", "jobs", "role", "roles", "position", "vacancy", "vacancies",
+            "application", "apply", "applying", "candidate", "hiring",
+            "staff", "technical", "program", "manager", "platform",
+            "careers", "career", "join", "team",
         }
         tokens = [t for t in n.split() if t not in suffixes]
         return " ".join(tokens)
@@ -178,7 +182,6 @@ class Storage:
 
         candidates = list(tbl.rows_where(where, params, limit=200))
         if not candidates:
-            # fallback: only token1
             candidates = list(tbl.rows_where("org_name like ?", [f"%{token1}%"], limit=200))
 
         best = None
@@ -192,7 +195,6 @@ class Storage:
             cand_set = set(cand_norm.split())
             if not cand_set:
                 continue
-            # Jaccard similarity on tokens
             inter = len(tgt_set & cand_set)
             union = len(tgt_set | cand_set)
             score = inter / union if union else 0.0
@@ -200,7 +202,8 @@ class Storage:
                 best_score = score
                 best = row
 
-        # Conservative threshold to avoid false positives
-        if best is not None and best_score >= 0.85:
+        # Balanced threshold: strict enough to avoid obvious false positives,
+        # but tolerant of messy labels (e.g. "Job Application for … at <Company>").
+        if best is not None and best_score >= 0.72:
             return dict(best)
         return None
