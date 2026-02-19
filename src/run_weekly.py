@@ -170,6 +170,8 @@ def _director_signals(
     """
     Return:
       corporate_director, foreign_director_hub, missing_fields_seen
+
+    NOTE: This can be expensive because it may call appointment endpoints.
     """
     corp = any((d.get("officer_role") or "").lower() == "corporate-director" for d in active_directors)
     foreign_hub = False
@@ -270,6 +272,11 @@ def build_html_email(leads: List[Lead], run_ts: datetime, window_from: str, wind
 def main():
     log.info("Starting CW Structured Sponsor Leads Bot")
 
+    # Speed knobs (safe defaults)
+    TARGET_QUALIFIED_POOL = int(os.getenv("TARGET_QUALIFIED_POOL", "120"))
+    MAX_EVAL_CANDIDATES = int(os.getenv("MAX_EVAL_CANDIDATES", "600"))
+    MAX_SEEDED_CANDIDATES = int(os.getenv("MAX_SEEDED_CANDIDATES", "600"))
+
     cfg = load_config()
     os.makedirs(os.path.dirname(cfg.cache_path), exist_ok=True)
 
@@ -297,6 +304,10 @@ def main():
 
     candidates: Dict[str, Dict[str, Any]] = {}
     log.info("Beginning Companies House advanced search (SIC allowlist seeding)...")
+    log.info(
+        f"Seeding caps: MAX_SEEDED_CANDIDATES={MAX_SEEDED_CANDIDATES} | "
+        f"Eval caps: MAX_EVAL_CANDIDATES={MAX_EVAL_CANDIDATES}, TARGET_QUALIFIED_POOL={TARGET_QUALIFIED_POOL}"
+    )
 
     for sic in sorted(ALLOWLIST):
         log.info(f"Searching SIC {sic}...")
@@ -324,27 +335,35 @@ def main():
             if len(items) < cfg.advanced_page_size:
                 break
 
+            if len(candidates) >= MAX_SEEDED_CANDIDATES:
+                break
+
         sic_added = len(candidates) - sic_before
         log.info(f"SIC {sic} done. Added {sic_added} new candidates. Total candidates now {len(candidates)}")
 
-        if len(candidates) >= 1500:
-            log.info("Candidate pool reached 1500+. Stopping SIC seeding early.")
+        if len(candidates) >= MAX_SEEDED_CANDIDATES:
+            log.info(f"Reached MAX_SEEDED_CANDIDATES={MAX_SEEDED_CANDIDATES}. Stopping SIC seeding early.")
             break
 
     log.info(f"Candidate pool size after seeding: {len(candidates)}")
+    log.info("Evaluating candidates...")
 
     leads: List[Lead] = []
-    log.info("Evaluating candidates...")
 
     for cn in list(candidates.keys()):
         stats["candidates_seen"] += 1
 
-        # heartbeat every 25 processed
+        # Heartbeat every 25
         if stats["candidates_seen"] % 25 == 0:
             log.info(
                 f"Processed {stats['candidates_seen']} candidates | qualified={len(leads)} | "
                 f"cache_excl={stats['cache_excluded']} sponsor_excl={stats['sponsor_excluded']} geo_excl={stats['geo_excluded']}"
             )
+
+        # Hard cap evaluation count (speed)
+        if stats["candidates_seen"] >= MAX_EVAL_CANDIDATES:
+            log.info(f"Reached MAX_EVAL_CANDIDATES={MAX_EVAL_CANDIDATES}. Stopping evaluation early.")
+            break
 
         if cache.has(cn):
             stats["cache_excluded"] += 1
@@ -384,9 +403,11 @@ def main():
             stats["sponsor_excluded"] += 1
             continue
 
+        # PSC signals (strong, structured)
         pscs = _list_all_pscs(ch, cn)
         corporate_psc, foreign_psc_hub, psc_missing_any, psc_count, psc_types = _psc_signals(pscs)
 
+        # Directors (active only)
         officers = _list_all_officers(ch, cn)
         directors = _active_directors(officers)
         directors_count = len(directors)
@@ -395,22 +416,27 @@ def main():
         foreign_director_hub = False
         director_missing_any = False
 
+        # Only do expensive appointment lookups if PSC didn't already qualify it
         if not corporate_psc and not foreign_psc_hub:
             corp_d, foreign_d, missing_d = _director_signals(ch, cn, directors)
             corporate_director = corporate_director or corp_d
             foreign_director_hub = foreign_d
             director_missing_any = missing_d
 
+        # Strict foreign-linked qualification
         foreign_linked = corporate_psc or foreign_psc_hub or corporate_director or foreign_director_hub
         if not foreign_linked:
             continue
 
+        # Missing data fallback
         if (psc_missing_any or director_missing_any) and not corporate_psc:
             continue
 
+        # No PSC filings yet => exclude (per your rule)
         if psc_count == 0 and not corporate_psc:
             continue
 
+        # Mid-size proxy must pass
         if not _mid_size_ok(directors_count, psc_count, corporate_psc, corporate_director):
             continue
 
@@ -449,6 +475,11 @@ def main():
             )
         )
         stats["qualified_scored"] += 1
+
+        # Quality-preserving early stop: once we have a strong pool to rank
+        if len(leads) >= TARGET_QUALIFIED_POOL:
+            log.info(f"Reached TARGET_QUALIFIED_POOL={TARGET_QUALIFIED_POOL}. Stopping evaluation early.")
+            break
 
     leads.sort(key=lambda x: x.score, reverse=True)
     selected = leads[: cfg.max_leads]
