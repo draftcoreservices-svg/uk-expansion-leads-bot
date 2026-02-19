@@ -48,5 +48,10 @@ jobs:
           CW_CACHE_PATH: data/cw_cache.sqlite
           MAX_LEADS: "30"
 
+          # 🔥 SPEED CONTROL KNOBS (NEW)
+          TARGET_QUALIFIED_POOL: "120"
+          MAX_EVAL_CANDIDATES: "600"
+          MAX_SEEDED_CANDIDATES: "600"
+
         run: |
-          python -m src.run_weekly
+          python -u -m src.run_weekly
