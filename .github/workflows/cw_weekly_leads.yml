@@ -46,7 +46,7 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
 
           CW_CACHE_PATH: data/cw_cache.sqlite
-          MAX_LEADS: "30"
+          MAX_LEADS: "50"
 
           # 🔥 SPEED CONTROL KNOBS (NEW)
           TARGET_QUALIFIED_POOL: "120"
