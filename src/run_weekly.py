@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import logging
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta, date
 from typing import Any, Dict, List, Tuple
@@ -15,12 +17,30 @@ from .scoring import Signals, score as score_fn, ALLOWLIST, DENYLIST
 from .geo import infer_gb_nation
 from .emailer import send_html_email
 
+# -----------------------
+# Heartbeat logging setup
+# -----------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    stream=sys.stdout,
+)
+log = logging.getLogger("cw-bot")
+
 
 NAME_EXCLUDE_KEYWORDS = [
     # hard excludes you specified
-    "properties","property","investments","investment","holding","holdings","management","consulting",
+    "properties",
+    "property",
+    "investments",
+    "investment",
+    "holding",
+    "holdings",
+    "management",
+    "consulting",
     # extra conservative noise reducers
-    "real estate","estate",
+    "real estate",
+    "estate",
 ]
 
 
@@ -135,19 +155,21 @@ def _psc_signals(pscs: List[Dict[str, Any]]) -> Tuple[bool, bool, bool, int, Lis
                 missing_any = True
                 continue
 
-            # Your rule: either indicator counts; UK+foreign residence counts
-            if (nat and (not is_uk_value(nat)) and approved_hub(nat)) or (cor and (not is_uk_value(cor)) and approved_hub(cor)):
+            # Either indicator counts; UK nationality + foreign residence counts
+            if (nat and (not is_uk_value(nat)) and approved_hub(nat)) or (
+                cor and (not is_uk_value(cor)) and approved_hub(cor)
+            ):
                 foreign_hub = True
 
     return corporate, foreign_hub, missing_any, active_count, psc_types
 
 
-def _director_signals(ch: CHClient, company_number: str, active_directors: List[Dict[str, Any]]) -> Tuple[bool, bool, bool]:
+def _director_signals(
+    ch: CHClient, company_number: str, active_directors: List[Dict[str, Any]]
+) -> Tuple[bool, bool, bool]:
     """
     Return:
       corporate_director, foreign_director_hub, missing_fields_seen
-
-    Note: officers list often lacks nationality; we resolve appointment detail only when needed.
     """
     corp = any((d.get("officer_role") or "").lower() == "corporate-director" for d in active_directors)
     foreign_hub = False
@@ -171,7 +193,9 @@ def _director_signals(ch: CHClient, company_number: str, active_directors: List[
             missing = True
             continue
 
-        if (nat and (not is_uk_value(nat)) and approved_hub(nat)) or (cor and (not is_uk_value(cor)) and approved_hub(cor)):
+        if (nat and (not is_uk_value(nat)) and approved_hub(nat)) or (
+            cor and (not is_uk_value(cor)) and approved_hub(cor)
+        ):
             foreign_hub = True
             break
 
@@ -179,7 +203,6 @@ def _director_signals(ch: CHClient, company_number: str, active_directors: List[
 
 
 def _mid_size_ok(directors_count: int, psc_count: int, corporate_psc: bool, corporate_director: bool) -> bool:
-    # Must satisfy at least one proxy
     return (directors_count > 1) or (psc_count > 1) or corporate_psc or corporate_director
 
 
@@ -245,17 +268,22 @@ def build_html_email(leads: List[Lead], run_ts: datetime, window_from: str, wind
 
 
 def main():
+    log.info("Starting CW Structured Sponsor Leads Bot")
+
     cfg = load_config()
     os.makedirs(os.path.dirname(cfg.cache_path), exist_ok=True)
 
     ch = CHClient(cfg.companies_house_api_key)
     cache = LeadCache(cfg.cache_path)
-    sponsor = SponsorRegister.load(cfg.sponsor_register_url)
 
-    # Rolling last 12 months
+    log.info("Loading Sponsor Register...")
+    sponsor = SponsorRegister.load(cfg.sponsor_register_url)
+    log.info("Sponsor Register loaded")
+
     today = date.today()
     window_to = today.isoformat()
     window_from = (today - timedelta(days=365)).isoformat()
+    log.info(f"Incorporation window: {window_from} -> {window_to}")
 
     stats = {
         "candidates_seen": 0,
@@ -267,9 +295,13 @@ def main():
         "qualified_scored": 0,
     }
 
-    # Candidate pool seeded via allowlist SIC searches (keeps it structured + relevant)
     candidates: Dict[str, Dict[str, Any]] = {}
+    log.info("Beginning Companies House advanced search (SIC allowlist seeding)...")
+
     for sic in sorted(ALLOWLIST):
+        log.info(f"Searching SIC {sic}...")
+        sic_before = len(candidates)
+
         for page in range(cfg.max_pages_per_sic):
             start_index = page * cfg.advanced_page_size
             data = ch.advanced_search(
@@ -283,19 +315,36 @@ def main():
             items = data.get("items") or []
             if not items:
                 break
+
             for it in items:
                 cn = it.get("company_number")
                 if cn:
                     candidates.setdefault(cn, it)
+
             if len(items) < cfg.advanced_page_size:
                 break
+
+        sic_added = len(candidates) - sic_before
+        log.info(f"SIC {sic} done. Added {sic_added} new candidates. Total candidates now {len(candidates)}")
+
         if len(candidates) >= 1500:
+            log.info("Candidate pool reached 1500+. Stopping SIC seeding early.")
             break
 
+    log.info(f"Candidate pool size after seeding: {len(candidates)}")
+
     leads: List[Lead] = []
+    log.info("Evaluating candidates...")
 
     for cn in list(candidates.keys()):
         stats["candidates_seen"] += 1
+
+        # heartbeat every 25 processed
+        if stats["candidates_seen"] % 25 == 0:
+            log.info(
+                f"Processed {stats['candidates_seen']} candidates | qualified={len(leads)} | "
+                f"cache_excl={stats['cache_excluded']} sponsor_excl={stats['sponsor_excluded']} geo_excl={stats['geo_excluded']}"
+            )
 
         if cache.has(cn):
             stats["cache_excluded"] += 1
@@ -310,6 +359,7 @@ def main():
         inc_date = profile.get("date_of_creation")
         if not inc_date:
             continue
+
         age_days = _company_age_days(inc_date)
         if age_days < 0 or age_days > 365:
             continue
@@ -329,17 +379,14 @@ def main():
             stats["sic_missing_excluded"] += 1
             continue
 
-        # Sponsor register exclusion (exclude only when confident)
         licensed, lic_reason = sponsor.is_licensed(company_name, town)
         if licensed:
             stats["sponsor_excluded"] += 1
             continue
 
-        # PSC signals
         pscs = _list_all_pscs(ch, cn)
         corporate_psc, foreign_psc_hub, psc_missing_any, psc_count, psc_types = _psc_signals(pscs)
 
-        # Directors (active only)
         officers = _list_all_officers(ch, cn)
         directors = _active_directors(officers)
         directors_count = len(directors)
@@ -348,27 +395,22 @@ def main():
         foreign_director_hub = False
         director_missing_any = False
 
-        # Only resolve director appointment nationality/residence if needed
         if not corporate_psc and not foreign_psc_hub:
             corp_d, foreign_d, missing_d = _director_signals(ch, cn, directors)
             corporate_director = corporate_director or corp_d
             foreign_director_hub = foreign_d
             director_missing_any = missing_d
 
-        # Strict foreign-linked qualification
         foreign_linked = corporate_psc or foreign_psc_hub or corporate_director or foreign_director_hub
         if not foreign_linked:
             continue
 
-        # Missing data fallback
         if (psc_missing_any or director_missing_any) and not corporate_psc:
             continue
 
-        # No PSC filings yet => exclude (per your rule)
         if psc_count == 0 and not corporate_psc:
             continue
 
-        # Mid-size proxy must pass
         if not _mid_size_ok(directors_count, psc_count, corporate_psc, corporate_director):
             continue
 
@@ -409,7 +451,10 @@ def main():
         stats["qualified_scored"] += 1
 
     leads.sort(key=lambda x: x.score, reverse=True)
-    selected = leads[: cfg.max_leads]  # if < 30, email what we found
+    selected = leads[: cfg.max_leads]
+
+    log.info(f"Scoring complete. Qualified leads: {len(leads)} | Selected: {len(selected)}")
+    log.info("Sending email...")
 
     run_ts = datetime.now(timezone.utc)
     subject = f"CW Weekly Sponsor Leads — {run_ts.date().isoformat()} ({len(selected)})"
@@ -426,9 +471,10 @@ def main():
         html_body=html_body,
     )
 
-    # Cache the leads we emailed (company_number is the key)
+    log.info("Email sent successfully. Updating cache...")
     cache.add_many([(l.company_number, l.company_name) for l in selected])
     cache.close()
+    log.info("Cache updated. Run complete.")
 
 
 if __name__ == "__main__":
