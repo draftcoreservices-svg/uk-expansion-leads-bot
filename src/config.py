@@ -55,7 +55,7 @@ def load_config() -> Config:
         email_to=email_to,
         sponsor_register_url=os.getenv("SPONSOR_REGISTER_URL"),
         cache_path=os.getenv("CW_CACHE_PATH", "data/cw_cache.sqlite"),
-        max_leads=_env_int("MAX_LEADS", 30),
+        max_leads=_env_int("MAX_LEADS", 50),
         advanced_page_size=_env_int("ADVANCED_PAGE_SIZE", 200),
         max_pages_per_sic=_env_int("MAX_PAGES_PER_SIC", 10),
     )
