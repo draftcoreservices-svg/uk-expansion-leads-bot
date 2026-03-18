@@ -2,7 +2,6 @@ name: CW Weekly Sponsor Leads (Structured)
 
 on:
   schedule:
-    # Monday 07:00 UTC — gives ~2hr buffer before 9am UK time
     - cron: "0 7 * * 1"
   workflow_dispatch: {}
 
@@ -30,8 +29,7 @@ jobs:
         with:
           path: data/cw_cache.sqlite
           key: cw-cache-v2-${{ github.run_id }}
-          restore-keys: |
-             cw-cache-v2-
+          restore-keys: cw-cache-v2-
 
       - name: Install dependencies
         run: |
@@ -41,31 +39,16 @@ jobs:
       - name: Run Weekly Bot
         env:
           COMPANIES_HOUSE_API_KEY: ${{ secrets.COMPANIES_HOUSE_API_KEY }}
-
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
-
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
-          EMAIL_TO:   ${{ secrets.EMAIL_TO }}
-
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
           CW_CACHE_PATH: data/cw_cache.sqlite
           MAX_LEADS: "50"
-
           TARGET_QUALIFIED_POOL: "120"
-          MAX_EVAL_CANDIDATES:   "600"
+          MAX_EVAL_CANDIDATES: "600"
           MAX_SEEDED_CANDIDATES: "2000"
-
         run: |
           python -u -m src.run_weekly
-```
-
----
-
-And for the `.gitignore`, create another new file in the repo root called exactly `.gitignore` and paste this in:
-```
-__pycache__/
-*.pyc
-data/
-.env
